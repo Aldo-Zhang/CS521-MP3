@@ -28,6 +28,7 @@ echo "✅ All specified files have been updated."
 # ==============================
 # 4️⃣ Activate environment & navigate
 # ==============================
+cd /home/ec2-user
 echo "Activating Conda environment..."
 source ~/miniconda3/bin/activate
 conda activate mp3
