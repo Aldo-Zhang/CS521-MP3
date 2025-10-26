@@ -4120,13 +4120,15 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
       if (u->dot_dimension_numbers().SerializeAsString() != dnums.SerializeAsString()) continue;
       if (u->precision_config().SerializeAsString() != dot->precision_config().SerializeAsString()) continue;
       if (u->operand(1)->shape().rank() != 2) continue;
-      // Check if u is already being visited (to avoid infinite loops)
-      if (visited_.contains(u)) continue;
       other = u; break;
     }
     if (!other) break;
     // anti double-fire - only process if dot < other (smaller pointer) to avoid double-processing
     if (other < dot) break;
+    
+    // Mark both dots as visited before any replacements to prevent loops
+    visited_.insert(dot);
+    visited_.insert(other);
 
     HloInstruction* C = other->mutable_operand(1);
     const Shape& a = A->shape();
@@ -4162,12 +4164,11 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     HloInstruction* slice0 = make_slice(0,  N1);
     HloInstruction* slice1 = make_slice(N1, N1 + N2);
 
-    // Mark instructions as visited to prevent infinite loops
+    // Mark fused_dot as visited to prevent it from being processed again
     visited_.insert(fused_dot);
-    visited_.insert(other);
     
-    // Replace both original dots; now we can return
-    TF_RETURN_IF_ERROR(ReplaceInstruction(dot,   slice0));
+    // Replace both dots
+    TF_RETURN_IF_ERROR(ReplaceInstruction(dot, slice0));
     TF_RETURN_IF_ERROR(ReplaceInstruction(other, slice1));
     return absl::OkStatus();
   } while (false);
