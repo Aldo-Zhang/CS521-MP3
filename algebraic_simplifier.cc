@@ -4000,10 +4000,6 @@ AlgebraicSimplifierVisitor::MakeMultiplyForPrecisionAlgorithm(
 }
 
 absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
-  VLOG(10) << "HandleDot called for: " << dot->ToString();
-  VLOG(10) << "  computation_: " << (void*)computation_;
-  VLOG(10) << "  dot->parent(): " << (void*)dot->parent();
-  
   CHECK(computation_ == dot->parent());
   HloDotInstruction* dot_cast = Cast<HloDotInstruction>(dot);
   const auto& dnums = dot->dot_dimension_numbers();
@@ -4099,36 +4095,21 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   }
 
   // Fuse two matmul with concat and split (without early termnination)
-  VLOG(2) << "Attempting fusion for dot: " << dot->ToString();
-  VLOG(2) << "  dot->parent(): " << (void*)dot->parent();
-  VLOG(2) << "  computation_: " << (void*)computation_;
-  VLOG(2) << "  visited_.size(): " << visited_.size();
-  
   do {
-    if (dot->shape().rank() != 2) {
-      VLOG(2) << "  Skipping: dot rank != 2";
-      break;
-    }
+    if (dot->shape().rank() != 2) break;
     HloInstruction* A = dot->mutable_operand(0);
     HloInstruction* B = dot->mutable_operand(1);
-    if (A->shape().rank() != 2 || B->shape().rank() != 2) {
-      VLOG(2) << "  Skipping: operand ranks != 2";
-      break;
-    }
+    if (A->shape().rank() != 2 || B->shape().rank() != 2) break;
     
     // Don't apply fusion to instructions that are already the result of fusion
     // (i.e., instructions that have concatenate operands)
-    if (B->opcode() == HloOpcode::kConcatenate) {
-      VLOG(2) << "  Skipping: B is already concatenate";
-      break;
-    }
+    if (B->opcode() == HloOpcode::kConcatenate) break;
 
     const auto& dnums = dot->dot_dimension_numbers();
     if (!(dnums.lhs_contracting_dimensions_size() == 1 &&
           dnums.rhs_contracting_dimensions_size() == 1 &&
           dnums.lhs_contracting_dimensions(0) == 1 &&
           dnums.rhs_contracting_dimensions(0) == 0)) {
-      VLOG(2) << "  Skipping: not standard 2D matmul";
       break; // only standard 2D matmul here
     }
 
@@ -4141,48 +4122,34 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
       if (u->operand(1)->shape().rank() != 2) continue;
       other = u; break;
     }
-    if (!other) {
-      VLOG(2) << "  Skipping: no other dot found";
-      break;
-    }
-    VLOG(2) << "  Found other dot: " << other->ToString();
-    VLOG(2) << "  other->parent(): " << (void*)other->parent();
-    
+    if (!other) break;
     // anti double-fire - only process if dot < other (smaller pointer) to avoid double-processing
-    if (other < dot) {
-      VLOG(2) << "  Skipping: other < dot (anti double-fire)";
-      break;
-    }
+    if (other < dot) break;
     
     // Mark both dots as visited before any replacements to prevent loops
-    VLOG(2) << "  Marking dots as visited";
-    visited_.insert(dot);
+    // Note: dot is already in visited_ (added at start of HandleDot), 
+    // but we add other here to prevent reprocessing
+    if (!visited_.contains(dot)) {
+      visited_.insert(dot);
+    }
     visited_.insert(other);
-    VLOG(2) << "  visited_.size(): " << visited_.size();
 
     HloInstruction* C = other->mutable_operand(1);
     const Shape& a = A->shape();
     const Shape& b = B->shape();
     const Shape& c = C->shape();
     if (a.dimensions(1) != b.dimensions(0) ||
-        a.dimensions(1) != c.dimensions(0)) {
-      VLOG(2) << "  Skipping: dimension mismatch";
-      break;
-    }
+        a.dimensions(1) != c.dimensions(0)) break;
 
     const int64_t M  = a.dimensions(0);
     const int64_t K  = a.dimensions(1);
     const int64_t N1 = b.dimensions(1);
     const int64_t N2 = c.dimensions(1);
 
-    VLOG(2) << "  Fusion proceeding: M=" << M << ", K=" << K 
-            << ", N1=" << N1 << ", N2=" << N2;
-
     // RHS = Concatenate(B,C, axis=1)
     Shape rhs_shape = ShapeUtil::MakeShape(b.element_type(), {K, N1 + N2});
     auto* rhs_concat = computation_->AddInstruction(
         HloInstruction::CreateConcatenate(rhs_shape, {B, C}, /*dimension=*/1));
-    VLOG(2) << "  Created concat: " << rhs_concat->ToString();
 
     // Fused dot with same configs
     Shape fused_shape = ShapeUtil::MakeShape(b.element_type(), {M, N1 + N2});
@@ -4190,7 +4157,6 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
                                            dnums, dot->precision_config());
     HloInstruction* fused_dot =
         computation_->AddInstruction(std::move(fused));
-    VLOG(2) << "  Created fused_dot: " << fused_dot->ToString();
 
     // Two slices to recover the original outputs
     auto make_slice = [&](int64_t col_start, int64_t col_limit) {
@@ -4201,18 +4167,18 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     };
     HloInstruction* slice0 = make_slice(0,  N1);
     HloInstruction* slice1 = make_slice(N1, N1 + N2);
-    VLOG(2) << "  Created slices: " << slice0->ToString() << ", " << slice1->ToString();
 
     // Mark fused_dot as visited to prevent it from being processed again
     visited_.insert(fused_dot);
-    VLOG(2) << "  Marked fused_dot as visited, visited_.size()=" << visited_.size();
     
-    // Replace both dots
-    VLOG(2) << "  Replacing dot";
+    // Replace the current dot with slice0
     TF_RETURN_IF_ERROR(ReplaceInstruction(dot, slice0));
-    VLOG(2) << "  Replacing other";
-    TF_RETURN_IF_ERROR(ReplaceInstruction(other, slice1));
-    VLOG(2) << "  Fusion complete";
+    
+    // For other, we need to be careful. Since other is already marked as visited,
+    // the visitor will skip it. But we still need to replace it. Let's use
+    // ReplaceAllUsesWith which is safer when replacing an instruction that might
+    // be on the visitor's stack.
+    TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice1));
     return absl::OkStatus();
   } while (false);
 
