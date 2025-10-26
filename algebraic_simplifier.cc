@@ -4000,17 +4000,18 @@ AlgebraicSimplifierVisitor::MakeMultiplyForPrecisionAlgorithm(
 }
 
 // Fuse sibling matmuls: Dot(A,B) and Dot(A,C) -> Dot(A, Concat(B,C, dim=1)) + slices.
-// Returns true iff it performed a rewrite.
-static absl::StatusOr<bool> FuseSiblingMatmulsConcatSplit(HloInstruction* dot) {
-  if (dot == nullptr || dot->opcode() != HloOpcode::kDot) return false;
-  if (dot->shape().rank() != 2) return false;
+// If fusion happens, returns the replacement for `dot` (i.e., slice0). Otherwise returns nullptr.
+static absl::StatusOr<HloInstruction*>
+BuildFuseSiblingMatmulsConcatSplitReplacement(HloInstruction* dot) {
+  if (dot == nullptr || dot->opcode() != HloOpcode::kDot) return HloInstruction*(nullptr);
+  if (dot->shape().rank() != 2) return HloInstruction*(nullptr);
 
   HloInstruction* A = dot->mutable_operand(0);
   HloInstruction* B = dot->mutable_operand(1);
-  if (A->shape().rank() != 2 || B->shape().rank() != 2) return false;
+  if (A->shape().rank() != 2 || B->shape().rank() != 2) return HloInstruction*(nullptr);
 
-  // Do not fuse if RHS already a concat — prevents cascading concat and helps convergence.
-  if (B->opcode() == HloOpcode::kConcatenate) return false;
+  // Avoid cascading concat on RHS.
+  if (B->opcode() == HloOpcode::kConcatenate) return HloInstruction*(nullptr);
 
   const DotDimensionNumbers& dnums = dot->dot_dimension_numbers();
   const bool is_std_gemm =
@@ -4018,35 +4019,28 @@ static absl::StatusOr<bool> FuseSiblingMatmulsConcatSplit(HloInstruction* dot) {
       dnums.rhs_contracting_dimensions_size() == 1 &&
       dnums.lhs_contracting_dimensions(0) == 1 &&
       dnums.rhs_contracting_dimensions(0) == 0;
-  if (!is_std_gemm) return false;
+  if (!is_std_gemm) return HloInstruction*(nullptr);
 
-  // Find sibling Dot(A, C) with identical dot dims and precision.
+  // Find sibling Dot(A, C) with identical dnums and precision.
   HloInstruction* other = nullptr;
   for (HloInstruction* u : A->users()) {
     if (u == dot || u->opcode() != HloOpcode::kDot) continue;
     if (u->shape().rank() != 2) continue;
-    if (u->dot_dimension_numbers().SerializeAsString() !=
-        dnums.SerializeAsString()) {
-      continue;
-    }
-    if (u->precision_config().SerializeAsString() !=
-        dot->precision_config().SerializeAsString()) {
-      continue;
-    }
+    if (u->dot_dimension_numbers().SerializeAsString() != dnums.SerializeAsString()) continue;
+    if (u->precision_config().SerializeAsString() != dot->precision_config().SerializeAsString()) continue;
     if (u->operand(1)->shape().rank() != 2) continue;
     other = u;
     break;
   }
-  if (other == nullptr) return false;
+  if (other == nullptr) return HloInstruction*(nullptr);
 
-  // Anti double-fire: only fuse when processing the lower/equal unique_id side.
-  if (other->unique_id() < dot->unique_id()) return false;
-  if (other->user_count() == 0) return false;
+  // Anti double-fire: only fuse on the >= unique_id() side.
+  if (other->unique_id() < dot->unique_id()) return HloInstruction*(nullptr);
+  if (other->user_count() == 0) return HloInstruction*(nullptr);
 
   HloInstruction* C = other->mutable_operand(1);
-
-  // Also avoid cascading concat on C.
-  if (C->opcode() == HloOpcode::kConcatenate) return false;
+  // Avoid cascading concat on C as well.
+  if (C->opcode() == HloOpcode::kConcatenate) return HloInstruction*(nullptr);
 
   const Shape& a = A->shape();
   const Shape& b = B->shape();
@@ -4054,18 +4048,15 @@ static absl::StatusOr<bool> FuseSiblingMatmulsConcatSplit(HloInstruction* dot) {
 
   // K must match.
   if (a.dimensions(1) != b.dimensions(0) || a.dimensions(1) != c.dimensions(0)) {
-    return false;
+    return HloInstruction*(nullptr);
   }
 
-  // Inputs element types must match (standard Dot requires lhs/rhs same type).
-  if (a.element_type() != b.element_type() ||
-      a.element_type() != c.element_type()) {
-    return false;
+  // Input element types must match; output element types must match.
+  if (a.element_type() != b.element_type() || a.element_type() != c.element_type()) {
+    return HloInstruction*(nullptr);
   }
-
-  // Outputs element types must match (accumulator/out dtype).
   if (dot->shape().element_type() != other->shape().element_type()) {
-    return false;
+    return HloInstruction*(nullptr);
   }
 
   const int64_t M  = a.dimensions(0);
@@ -4073,48 +4064,46 @@ static absl::StatusOr<bool> FuseSiblingMatmulsConcatSplit(HloInstruction* dot) {
   const int64_t N1 = b.dimensions(1);
   const int64_t N2 = c.dimensions(1);
 
-  // Create concat(B, C) along N dimension (dim = 1).
-  HloComputation* comp = dot->parent();  // IMPORTANT: never use a cached computation_.
+  HloComputation* comp = dot->parent();
+
+  // RHS = concatenate(B, C) along dim=1 (fixed order for determinism).
   Shape rhs_shape = ShapeUtil::MakeShape(b.element_type(), {K, N1 + N2});
   HloInstruction* rhs_concat = comp->AddInstruction(
       HloInstruction::CreateConcatenate(rhs_shape, {B, C}, /*dimension=*/1));
 
-  // Create fused Dot with the same precision config; out dtype matches original dot's out type.
+  // Fused dot: out dtype equals original dot's out dtype (respect accum dtype).
   const PrimitiveType out_ty = dot->shape().element_type();
   Shape fused_shape = ShapeUtil::MakeShape(out_ty, {M, N1 + N2});
   HloInstruction* fused_dot = comp->AddInstruction(
-      HloInstruction::CreateDot(fused_shape, A, rhs_concat,
-                                dnums, dot->precision_config()));
-  // Preserve metadata/front-end attrs to aid debugging and downstream passes.
+      HloInstruction::CreateDot(fused_shape, A, rhs_concat, dnums, dot->precision_config()));
   fused_dot->set_metadata(dot->metadata());
   fused_dot->set_frontend_attributes(dot->frontend_attributes());
 
-  // Build slices to recover original outputs.
+  // Two slices to recover original outputs.
   auto make_slice = [&](int64_t col_start, int64_t col_limit) -> HloInstruction* {
     Shape s = ShapeUtil::MakeShape(out_ty, {M, col_limit - col_start});
-    return comp->AddInstruction(
-        HloInstruction::CreateSlice(
-            s, fused_dot,
-            /*start_indices=*/{0, col_start},
-            /*limit_indices=*/{M, col_limit},
-            /*strides=*/{1, 1}));
+    return comp->AddInstruction(HloInstruction::CreateSlice(
+        s, fused_dot,
+        /*start_indices=*/{0, col_start},
+        /*limit_indices=*/{M, col_limit},
+        /*strides=*/{1, 1}));
   };
-  HloInstruction* slice0 = make_slice(/*col_start=*/0,  /*col_limit=*/N1);
-  HloInstruction* slice1 = make_slice(/*col_start=*/N1, /*col_limit=*/N1 + N2);
+  HloInstruction* slice0 = make_slice(/*0*/0, /*N1*/N1);
+  HloInstruction* slice1 = make_slice(/*N1*/N1, /*N1+N2*/N1 + N2);
 
-  // Rewire 'other' first using ReplaceAllUsesWith (does not replace the node object).
+  // Rewire 'other' first (do not replace the node object here).
   TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice1));
+
+  // If dead, remove 'other' now (safe, we won't touch it afterwards).
   if (other->user_count() == 0) {
-    TF_RETURN_IF_ERROR(dot->parent()->RemoveInstruction(other));
+    TF_RETURN_IF_ERROR(comp->RemoveInstruction(other));
   }
 
-  // Then replace the current node 'dot'. DO NOT touch 'dot' or 'other' afterwards.
-  TF_RETURN_IF_ERROR(ReplaceInstruction(dot, slice0));
-
-  VLOG(10) << "Fused two sibling matmuls via concat+slice: produced one dot and two slices.";
-  return true;
+  // Return slice0 so the caller (visitor) can ReplaceInstruction(dot, slice0)
+  // and correctly mark the pass as changed.
+  VLOG(10) << "Built concat+fused-dot+slices for sibling matmuls.";
+  return slice0;
 }
-
 absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   CHECK(computation_ == dot->parent());
   HloDotInstruction* dot_cast = Cast<HloDotInstruction>(dot);
@@ -4210,11 +4199,15 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     return ReplaceInstruction(dot, dot_of_gather_optimized);
   }
 
-  // -------- Our fusion lives here --------
-  TF_ASSIGN_OR_RETURN(bool fused, FuseSiblingMatmulsConcatSplit(dot));
-  if (fused) {
-    // We performed a rewrite; stop here so later rules don't touch fresh graph.
-    return absl::OkStatus();
+  // Try to fuse Dot(A,B) + Dot(A,C) -> Dot(A, concat(B,C)) + slices.
+  {
+    TF_ASSIGN_OR_RETURN(HloInstruction* repl,
+                        BuildFuseSiblingMatmulsConcatSplitReplacement(dot));
+    if (repl != nullptr) {
+      // Use the visitor API so `changed` is reported correctly.
+      TF_RETURN_IF_ERROR(ReplaceInstruction(dot, repl));
+      return absl::OkStatus();  // stop after rewrite
+    }
   }
   
   TF_ASSIGN_OR_RETURN(bool removed_degenerate_dimensions,
