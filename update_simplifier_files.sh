@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SRC_DIR="${SRC_DIR:-$HOME/mp3_code/CS521-MP3}"   # ← 改成你的源目录
-DST_DIR="${DST_DIR:-$HOME/xla/xla/hlo/transforms/simplifiers}"
+# 让脚本用“当前目录”为源，用 XLA 的 simplifiers 目录为目标，并打印执行细节
+SRC_DIR="$PWD" \
+DST_DIR="$HOME/xla/xla/hlo/transforms/simplifiers" \
 
 echo "[INFO] SRC=$(realpath "$SRC_DIR")"
 echo "[INFO] DST=$(realpath "$DST_DIR")"
