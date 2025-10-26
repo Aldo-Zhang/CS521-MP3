@@ -4168,6 +4168,14 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     // Replace other using ReplaceAllUsesWith
     TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice1));
     
+    // Now remove the old instructions that have no users
+    if (dot->user_count() == 0) {
+      TF_RETURN_IF_ERROR(computation_->RemoveInstruction(dot));
+    }
+    if (other->user_count() == 0) {
+      TF_RETURN_IF_ERROR(computation_->RemoveInstruction(other));
+    }
+    
     return absl::OkStatus();
   } while (false);
 
