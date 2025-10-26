@@ -1684,6 +1684,46 @@ TEST_F(AlgebraicSimplifierTest, SubZero) {
   EXPECT_EQ(root, param0);
 }
 
+TEST_F(AlgebraicSimplifierTest, DistDivScalar) {
+  auto m = CreateNewVerifiedModule();
+
+  // x, z: same-rank same-size tensors; y: scalar (implicitly broadcast).
+  const Shape tensor = ShapeUtil::MakeShape(F32, {2, 3});
+  const Shape scalar = ShapeUtil::MakeShape(F32, {});
+
+  HloComputation::Builder b(TestName());
+  auto* x = b.AddInstruction(HloInstruction::CreateParameter(0, tensor, "x"));
+  auto* y = b.AddInstruction(HloInstruction::CreateParameter(1, scalar, "y"));
+  auto* z = b.AddInstruction(HloInstruction::CreateParameter(2, tensor, "z"));
+
+  // (x / y) + (z / y)  — elementwise ops allow y (scalar) to be implicitly broadcast.
+  auto* d0 = b.AddInstruction(
+      HloInstruction::CreateBinary(tensor, HloOpcode::kDivide, x, y));
+  auto* d1 = b.AddInstruction(
+      HloInstruction::CreateBinary(tensor, HloOpcode::kDivide, z, y));
+  b.AddInstruction(HloInstruction::CreateBinary(tensor, HloOpcode::kAdd, d0, d1));
+
+  auto* computation = m->AddEntryComputationWithLayouts(b.Build());
+
+  AlgebraicSimplifier simplifier(default_options_);
+  ASSERT_TRUE(simplifier.Run(m.get()).value());
+
+  // Expect the root to be (x + z) / y
+  HloInstruction* root = computation->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kDivide);
+  ASSERT_TRUE(ShapeUtil::Compatible(root->shape(), tensor));
+
+  HloInstruction* num = root->mutable_operand(0);
+  HloInstruction* den = root->mutable_operand(1);
+
+  ASSERT_EQ(num->opcode(), HloOpcode::kAdd);
+  EXPECT_EQ(num->operand(0), x);
+  EXPECT_EQ(num->operand(1), z);
+
+  // Denominator should still be the same scalar 'y' node.
+  EXPECT_EQ(den, y);
+}
+
 // Test that A - Const is canonicalized to A + (-Const).
 TEST_F(AlgebraicSimplifierTest, SubConstCanonicalization) {
   auto m = CreateNewVerifiedModule();
