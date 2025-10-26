@@ -4100,6 +4100,10 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     HloInstruction* A = dot->mutable_operand(0);
     HloInstruction* B = dot->mutable_operand(1);
     if (A->shape().rank() != 2 || B->shape().rank() != 2) break;
+    
+    // Don't apply fusion to instructions that are already the result of fusion
+    // (i.e., instructions that have concatenate operands)
+    if (B->opcode() == HloOpcode::kConcatenate) break;
 
     const auto& dnums = dot->dot_dimension_numbers();
     if (!(dnums.lhs_contracting_dimensions_size() == 1 &&
@@ -4157,9 +4161,8 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     HloInstruction* slice1 = make_slice(N1, N1 + N2);
 
     // Replace both original dots; now we can return
-    // Note: Replace other first to avoid issues with dot being processed
-    TF_RETURN_IF_ERROR(ReplaceInstruction(other, slice1));
     TF_RETURN_IF_ERROR(ReplaceInstruction(dot,   slice0));
+    TF_RETURN_IF_ERROR(ReplaceInstruction(other, slice1));
     return absl::OkStatus();
   } while (false);
 
