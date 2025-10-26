@@ -7540,8 +7540,24 @@ TEST_F(AlgebraicSimplifierTest, FuseTwoMatmuls_ConcatAndSplit) {
   auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, b_s, "B"));
   auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, c_s, "C"));
 
-  auto* O1 = b.AddInstruction(HloInstruction::CreateDot(A, B));
-  auto* O2 = b.AddInstruction(HloInstruction::CreateDot(A, C));
+  const Shape& a_shape = A->shape();
+  const Shape& b_shape = B->shape();
+  const Shape& c_shape = C->shape();
+  CHECK_EQ(a_shape.dimensions(1), b_shape.dimensions(0));
+  CHECK_EQ(a_shape.dimensions(1), c_shape.dimensions(0));
+
+  DotDimensionNumbers dnums;
+  dnums.add_lhs_contracting_dimensions(1);
+  dnums.add_rhs_contracting_dimensions(0);
+
+  PrecisionConfig prec;
+
+  Shape o1_shape = ShapeUtil::MakeShape(a_shape.element_type(),
+                                        {a_shape.dimensions(0), b_shape.dimensions(1)});
+  Shape o2_shape = ShapeUtil::MakeShape(a_shape.element_type(),
+                                        {a_shape.dimensions(0), c_shape.dimensions(1)});
+  auto* O1 = b.AddInstruction(HloInstruction::CreateDot(o1_shape, A, B, dnums, prec));
+  auto* O2 = b.AddInstruction(HloInstruction::CreateDot(o2_shape, A, C, dnums, prec));
 
   auto* root = b.AddInstruction(HloInstruction::CreateTuple({O1, O2}));
   auto* computation = m->AddEntryComputationWithLayouts(b.Build());
