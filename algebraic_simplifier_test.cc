@@ -7562,8 +7562,11 @@ TEST_F(AlgebraicSimplifierTest, FuseTwoMatmuls_ConcatAndSplit) {
   auto* root = b.AddInstruction(HloInstruction::CreateTuple({O1, O2}));
   auto* computation = m->AddEntryComputationWithLayouts(b.Build());
 
-  AlgebraicSimplifier simplifier(default_options_);
-  ASSERT_TRUE(simplifier.Run(m.get()).value());
+  AlgebraicSimplifierOptions opts = default_options_;
+  AlgebraicSimplifier simplifier(opts);
+
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
+  ASSERT_TRUE(changed);
 
   // After rewrite: root is Tuple{ Slice(D, [0,0]->[M,N1]), Slice(D, [0,N1]->[M,N1+N2]) },
   // and there is exactly one Dot with RHS = Concatenate(B,C,1).
