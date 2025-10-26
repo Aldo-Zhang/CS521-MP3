@@ -4095,90 +4095,79 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   }
 
   // Fuse two matmul with concat and split (without early termnination)
-  do {
-    if (dot->shape().rank() != 2) break;
-    HloInstruction* A = dot->mutable_operand(0);
-    HloInstruction* B = dot->mutable_operand(1);
-    if (A->shape().rank() != 2 || B->shape().rank() != 2) break;
-    
-    // Don't apply fusion to instructions that are already the result of fusion
-    // (i.e., instructions that have concatenate operands)
-    if (B->opcode() == HloOpcode::kConcatenate) break;
-
-    const auto& dnums = dot->dot_dimension_numbers();
-    if (!(dnums.lhs_contracting_dimensions_size() == 1 &&
-          dnums.rhs_contracting_dimensions_size() == 1 &&
-          dnums.lhs_contracting_dimensions(0) == 1 &&
-          dnums.rhs_contracting_dimensions(0) == 0)) {
-      break; // only standard 2D matmul here
-    }
-
-    // Find sibling Dot(A, C) with identical configs
-    HloInstruction* other = nullptr;
-    for (HloInstruction* u : A->users()) {
-      if (u == dot || u->opcode() != HloOpcode::kDot) continue;
-      if (u->dot_dimension_numbers().SerializeAsString() != dnums.SerializeAsString()) continue;
-      if (u->precision_config().SerializeAsString() != dot->precision_config().SerializeAsString()) continue;
-      if (u->operand(1)->shape().rank() != 2) continue;
-      other = u; break;
-    }
-    if (!other) break;
-    // anti double-fire - only process if dot < other (smaller pointer) to avoid double-processing
-    if (other < dot) break;
-    
-    // Check if other is already being processed or replaced - if so, skip
-    if (other->user_count() == 0) break;
-
-    HloInstruction* C = other->mutable_operand(1);
-    const Shape& a = A->shape();
-    const Shape& b = B->shape();
-    const Shape& c = C->shape();
-    if (a.dimensions(1) != b.dimensions(0) ||
-        a.dimensions(1) != c.dimensions(0)) break;
-
-    const int64_t M  = a.dimensions(0);
-    const int64_t K  = a.dimensions(1);
-    const int64_t N1 = b.dimensions(1);
-    const int64_t N2 = c.dimensions(1);
-
-    // RHS = Concatenate(B,C, axis=1)
-    Shape rhs_shape = ShapeUtil::MakeShape(b.element_type(), {K, N1 + N2});
-    auto* rhs_concat = computation_->AddInstruction(
-        HloInstruction::CreateConcatenate(rhs_shape, {B, C}, /*dimension=*/1));
-
-    // Fused dot with same configs
-    Shape fused_shape = ShapeUtil::MakeShape(b.element_type(), {M, N1 + N2});
-    auto fused = HloInstruction::CreateDot(fused_shape, A, rhs_concat,
-                                           dnums, dot->precision_config());
-    HloInstruction* fused_dot =
-        computation_->AddInstruction(std::move(fused));
-
-    // Two slices to recover the original outputs
-    auto make_slice = [&](int64_t col_start, int64_t col_limit) {
-      Shape s = ShapeUtil::MakeShape(b.element_type(), {M, col_limit - col_start});
-      return computation_->AddInstruction(HloInstruction::CreateSlice(
-          s, fused_dot, /*start_indices=*/{0, col_start},
-          /*limit_indices=*/{M, col_limit}, /*strides=*/{1, 1}));
-    };
-    HloInstruction* slice0 = make_slice(0,  N1);
-    HloInstruction* slice1 = make_slice(N1, N1 + N2);
-
-    // Replace the current dot using ReplaceInstruction (which marks changes)
-    TF_RETURN_IF_ERROR(ReplaceInstruction(dot, slice0));
-    // Replace other using ReplaceAllUsesWith
-    TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice1));
-    
-    // Now remove the old instructions that have no users
-    if (dot->user_count() == 0) {
-      TF_RETURN_IF_ERROR(computation_->RemoveInstruction(dot));
-    }
-    if (other->user_count() == 0) {
-      TF_RETURN_IF_ERROR(computation_->RemoveInstruction(other));
-    }
-    
+  if (dot->shape().rank() != 2) return absl::OkStatus();
+  HloInstruction* A = dot->mutable_operand(0);
+  HloInstruction* B = dot->mutable_operand(1);
+  if (A->shape().rank() != 2 || B->shape().rank() != 2) return absl::OkStatus();
+  
+  // Don't apply fusion to instructions that are already the result of fusion
+  if (B->opcode() == HloOpcode::kConcatenate) return absl::OkStatus();
+  
+  const auto& dnums = dot->dot_dimension_numbers();
+  if (!(dnums.lhs_contracting_dimensions_size() == 1 &&
+        dnums.rhs_contracting_dimensions_size() == 1 &&
+        dnums.lhs_contracting_dimensions(0) == 1 &&
+        dnums.rhs_contracting_dimensions(0) == 0)) {
     return absl::OkStatus();
-  } while (false);
-
+  }
+  
+  // Find sibling Dot(A, C) with identical configs
+  HloInstruction* other = nullptr;
+  for (HloInstruction* u : A->users()) {
+    if (u == dot || u->opcode() != HloOpcode::kDot) continue;
+    if (u->dot_dimension_numbers().SerializeAsString() != dnums.SerializeAsString()) continue;
+    if (u->precision_config().SerializeAsString() != dot->precision_config().SerializeAsString()) continue;
+    if (u->operand(1)->shape().rank() != 2) continue;
+    other = u; break;
+  }
+  if (!other) return absl::OkStatus();
+  if (other < dot) return absl::OkStatus();
+  if (other->user_count() == 0) return absl::OkStatus();
+  
+  HloInstruction* C = other->mutable_operand(1);
+  const Shape& a = A->shape();
+  const Shape& b = B->shape();
+  const Shape& c = C->shape();
+  if (a.dimensions(1) != b.dimensions(0) ||
+      a.dimensions(1) != c.dimensions(0)) return absl::OkStatus();
+  
+  const int64_t M  = a.dimensions(0);
+  const int64_t K  = a.dimensions(1);
+  const int64_t N1 = b.dimensions(1);
+  const int64_t N2 = c.dimensions(1);
+  
+  // RHS = Concatenate(B,C, axis=1)
+  Shape rhs_shape = ShapeUtil::MakeShape(b.element_type(), {K, N1 + N2});
+  auto* rhs_concat = computation_->AddInstruction(
+      HloInstruction::CreateConcatenate(rhs_shape, {B, C}, /*dimension=*/1));
+  
+  // Fused dot with same configs
+  Shape fused_shape = ShapeUtil::MakeShape(b.element_type(), {M, N1 + N2});
+  auto fused = HloInstruction::CreateDot(fused_shape, A, rhs_concat, dnums, dot->precision_config());
+  HloInstruction* fused_dot = computation_->AddInstruction(std::move(fused));
+  
+  // Two slices to recover the original outputs
+  auto make_slice = [&](int64_t col_start, int64_t col_limit) {
+    Shape s = ShapeUtil::MakeShape(b.element_type(), {M, col_limit - col_start});
+    return computation_->AddInstruction(HloInstruction::CreateSlice(
+        s, fused_dot, /*start_indices=*/{0, col_start},
+        /*limit_indices=*/{M, col_limit}, /*strides=*/{1, 1}));
+  };
+  HloInstruction* slice0 = make_slice(0,  N1);
+  HloInstruction* slice1 = make_slice(N1, N1 + N2);
+  
+  TF_RETURN_IF_ERROR(ReplaceInstruction(dot, slice0));
+  TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice1));
+  
+  if (dot->user_count() == 0) {
+    TF_RETURN_IF_ERROR(computation_->RemoveInstruction(dot));
+  }
+  if (other->user_count() == 0) {
+    TF_RETURN_IF_ERROR(computation_->RemoveInstruction(other));
+  }
+  
+  return absl::OkStatus();
+  
   TF_ASSIGN_OR_RETURN(bool removed_degenerate_dimensions,
                       RemoveDegenerateDimensionFromDot(dot_cast));
   if (removed_degenerate_dimensions) {
