@@ -4140,7 +4140,7 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
 
     // RHS = Concatenate(B,C, axis=1)
     Shape rhs_shape = ShapeUtil::MakeShape(b.element_type(), {K, N1 + N2});
-    auto* rhs_concat = dot->parent()->AddInstruction(
+    auto* rhs_concat = computation_->AddInstruction(
         HloInstruction::CreateConcatenate(rhs_shape, {B, C}, /*dimension=*/1));
 
     // Fused dot with same configs
@@ -4148,12 +4148,12 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     auto fused = HloInstruction::CreateDot(fused_shape, A, rhs_concat,
                                            dnums, dot->precision_config());
     HloInstruction* fused_dot =
-        dot->parent()->AddInstruction(std::move(fused));
+        computation_->AddInstruction(std::move(fused));
 
     // Two slices to recover the original outputs
     auto make_slice = [&](int64_t col_start, int64_t col_limit) {
       Shape s = ShapeUtil::MakeShape(b.element_type(), {M, col_limit - col_start});
-      return dot->parent()->AddInstruction(HloInstruction::CreateSlice(
+      return computation_->AddInstruction(HloInstruction::CreateSlice(
           s, fused_dot, /*start_indices=*/{0, col_start},
           /*limit_indices=*/{M, col_limit}, /*strides=*/{1, 1}));
     };
