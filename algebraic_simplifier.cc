@@ -4125,14 +4125,6 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     if (!other) break;
     // anti double-fire - only process if dot < other (smaller pointer) to avoid double-processing
     if (other < dot) break;
-    
-    // Mark both dots as visited before any replacements to prevent loops
-    // Note: dot is already in visited_ (added at start of HandleDot), 
-    // but we add other here to prevent reprocessing
-    if (!visited_.contains(dot)) {
-      visited_.insert(dot);
-    }
-    visited_.insert(other);
 
     HloInstruction* C = other->mutable_operand(1);
     const Shape& a = A->shape();
@@ -4168,16 +4160,10 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     HloInstruction* slice0 = make_slice(0,  N1);
     HloInstruction* slice1 = make_slice(N1, N1 + N2);
 
-    // Mark fused_dot as visited to prevent it from being processed again
-    visited_.insert(fused_dot);
-    
-    // Replace the current dot with slice0
-    TF_RETURN_IF_ERROR(ReplaceInstruction(dot, slice0));
-    
-    // For other, we need to be careful. Since other is already marked as visited,
-    // the visitor will skip it. But we still need to replace it. Let's use
-    // ReplaceAllUsesWith which is safer when replacing an instruction that might
-    // be on the visitor's stack.
+    // Replace both dots
+    // Note: We replace other using ReplaceAllUsesWith which is safer than ReplaceInstruction
+    // when dealing with an instruction that might still be in the visitor's iteration.
+    TF_RETURN_IF_ERROR(dot->ReplaceAllUsesWith(slice0));
     TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice1));
     return absl::OkStatus();
   } while (false);
