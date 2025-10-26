@@ -4157,8 +4157,9 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     HloInstruction* slice1 = make_slice(N1, N1 + N2);
 
     // Replace both original dots; now we can return
-    TF_RETURN_IF_ERROR(ReplaceInstruction(dot,   slice0));
+    // Note: Replace other first to avoid issues with dot being processed
     TF_RETURN_IF_ERROR(ReplaceInstruction(other, slice1));
+    TF_RETURN_IF_ERROR(ReplaceInstruction(dot,   slice0));
     return absl::OkStatus();
   } while (false);
 
