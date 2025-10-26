@@ -4125,6 +4125,9 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     if (!other) break;
     // anti double-fire - only process if dot < other (smaller pointer) to avoid double-processing
     if (other < dot) break;
+    
+    // Check if other is already being processed or replaced - if so, skip
+    if (other->user_count() == 0) break;
 
     HloInstruction* C = other->mutable_operand(1);
     const Shape& a = A->shape();
@@ -4160,16 +4163,10 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     HloInstruction* slice0 = make_slice(0,  N1);
     HloInstruction* slice1 = make_slice(N1, N1 + N2);
 
-    // Replace all uses of both dots with their corresponding slices
-    TF_RETURN_IF_ERROR(dot->ReplaceAllUsesWith(slice0));
+    // Replace the current dot using ReplaceInstruction (which marks changes)
+    TF_RETURN_IF_ERROR(ReplaceInstruction(dot, slice0));
+    // Replace other using ReplaceAllUsesWith
     TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice1));
-    
-    // Remove the old dot instructions from the computation since they no longer have users
-    TF_RETURN_IF_ERROR(computation_->RemoveInstruction(dot));
-    TF_RETURN_IF_ERROR(computation_->RemoveInstruction(other));
-    
-    // Mark that we've made changes
-    MarkAsChanged();
     
     return absl::OkStatus();
   } while (false);
