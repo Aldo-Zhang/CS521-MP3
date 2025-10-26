@@ -4102,8 +4102,6 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   
   // Don't apply fusion to instructions that are already the result of fusion
   if (B->opcode() == HloOpcode::kConcatenate) return absl::OkStatus();
-  
-  const auto& dnums = dot->dot_dimension_numbers();
   if (!(dnums.lhs_contracting_dimensions_size() == 1 &&
         dnums.rhs_contracting_dimensions_size() == 1 &&
         dnums.lhs_contracting_dimensions(0) == 1 &&
