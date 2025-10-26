@@ -4104,9 +4104,12 @@ static absl::StatusOr<bool> FuseSiblingMatmulsConcatSplit(HloInstruction* dot) {
 
   // Rewire 'other' first using ReplaceAllUsesWith (does not replace the node object).
   TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice1));
+  if (other->user_count() == 0) {
+    TF_RETURN_IF_ERROR(dot->parent()->RemoveInstruction(other));
+  }
 
   // Then replace the current node 'dot'. DO NOT touch 'dot' or 'other' afterwards.
-  TF_RETURN_IF_ERROR(comp->ReplaceInstruction(dot, slice0));
+  TF_RETURN_IF_ERROR(ReplaceInstruction(dot, slice0));
 
   VLOG(10) << "Fused two sibling matmuls via concat+slice: produced one dot and two slices.";
   return true;
