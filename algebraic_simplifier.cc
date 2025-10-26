@@ -4113,8 +4113,8 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     HloInstruction* other = nullptr;
     for (HloInstruction* u : A->users()) {
       if (u == dot || u->opcode() != HloOpcode::kDot) continue;
-      if (!absl::EqualsProto(u->dot_dimension_numbers(), dnums)) continue;
-      if (!absl::EqualsProto(u->precision_config(), dot->precision_config())) continue;
+      if (u->dot_dimension_numbers().SerializeAsString() != dnums.SerializeAsString()) continue;
+      if (u->precision_config().SerializeAsString() != dot->precision_config().SerializeAsString()) continue;
       if (u->operand(1)->shape().rank() != 2) continue;
       other = u; break;
     }
