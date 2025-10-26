@@ -7529,47 +7529,44 @@ TEST_F(AlgebraicSimplifierTest, BatchDotTransposeOperands) {
 TEST_F(AlgebraicSimplifierTest, FuseTwoMatmuls_ConcatAndSplit) {
   auto m = CreateNewVerifiedModule();
 
-  const Shape a_s = ShapeUtil::MakeShape(F32, {8, 16});   // A:[M,K]
-  const Shape b_s = ShapeUtil::MakeShape(F32, {16, 10});  // B:[K,N1]
-  const Shape c_s = ShapeUtil::MakeShape(F32, {16, 7});   // C:[K,N2]
-  const Shape o1_s = ShapeUtil::MakeShape(F32, {8, 10});  // (M, N1)
-  const Shape o2_s = ShapeUtil::MakeShape(F32, {8, 7});   // (M, N2)
+  // A:[M,K], B:[K,N1], C:[K,N2]
+  const Shape a_s = ShapeUtil::MakeShape(F32, {8, 16});
+  const Shape b_s = ShapeUtil::MakeShape(F32, {16, 10});
+  const Shape c_s = ShapeUtil::MakeShape(F32, {16, 7});
+  const Shape o1_s = ShapeUtil::MakeShape(F32, {8, 10});
+  const Shape o2_s = ShapeUtil::MakeShape(F32, {8, 7});
 
   HloComputation::Builder b(TestName());
   auto* A = b.AddInstruction(HloInstruction::CreateParameter(0, a_s, "A"));
   auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, b_s, "B"));
   auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, c_s, "C"));
 
-  const Shape& a_shape = A->shape();
-  const Shape& b_shape = B->shape();
-  const Shape& c_shape = C->shape();
-  CHECK_EQ(a_shape.dimensions(1), b_shape.dimensions(0));
-  CHECK_EQ(a_shape.dimensions(1), c_shape.dimensions(0));
-
+  // Standard 2D matmul dnums
   DotDimensionNumbers dnums;
   dnums.add_lhs_contracting_dimensions(1);
   dnums.add_rhs_contracting_dimensions(0);
 
-  PrecisionConfig prec;
+  // Use the explicit 5-arg CreateDot.
+  Shape o1_shape =
+      ShapeUtil::MakeShape(F32, {a_s.dimensions(0), b_s.dimensions(1)});
+  Shape o2_shape =
+      ShapeUtil::MakeShape(F32, {a_s.dimensions(0), c_s.dimensions(1)});
 
-  Shape o1_shape = ShapeUtil::MakeShape(a_shape.element_type(),
-                                        {a_shape.dimensions(0), b_shape.dimensions(1)});
-  Shape o2_shape = ShapeUtil::MakeShape(a_shape.element_type(),
-                                        {a_shape.dimensions(0), c_shape.dimensions(1)});
-  auto* O1 = b.AddInstruction(HloInstruction::CreateDot(o1_shape, A, B, dnums, prec));
-  auto* O2 = b.AddInstruction(HloInstruction::CreateDot(o2_shape, A, C, dnums, prec));
+  auto* O1 = b.AddInstruction(
+      HloInstruction::CreateDot(o1_shape, A, B, dnums, DefaultPrecisionConfig(2)));
+  auto* O2 = b.AddInstruction(
+      HloInstruction::CreateDot(o2_shape, A, C, dnums, DefaultPrecisionConfig(2)));
 
-  auto* root = b.AddInstruction(HloInstruction::CreateTuple({O1, O2}));
+  b.AddInstruction(HloInstruction::CreateTuple({O1, O2}));
   auto* computation = m->AddEntryComputationWithLayouts(b.Build());
 
+  // IMPORTANT: run the pass via helper to keep visitor/computation_ in sync.
   AlgebraicSimplifierOptions opts = default_options_;
   AlgebraicSimplifier simplifier(opts);
-
   TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
   ASSERT_TRUE(changed);
 
-  // After rewrite: root is Tuple{ Slice(D, [0,0]->[M,N1]), Slice(D, [0,N1]->[M,N1+N2]) },
-  // and there is exactly one Dot with RHS = Concatenate(B,C,1).
+  // Root stays a tuple of two slices.
   HloInstruction* new_root = computation->root_instruction();
   ASSERT_EQ(new_root->opcode(), HloOpcode::kTuple);
 
@@ -7583,19 +7580,29 @@ TEST_F(AlgebraicSimplifierTest, FuseTwoMatmuls_ConcatAndSplit) {
   ASSERT_EQ(fused, s1->mutable_operand(0));
   ASSERT_EQ(fused->opcode(), HloOpcode::kDot);
 
-  // RHS of fused dot is Concatenate(B,C,1)
+  // Fused dot output shape must be [M, N1+N2].
+  EXPECT_TRUE(ShapeUtil::Compatible(
+      fused->shape(), ShapeUtil::MakeShape(F32, {8, 10 + 7})));
+
+  // RHS of fused dot is Concatenate(B, C, axis=1). Order may be (B,C) or (C,B).
   HloInstruction* rhs = fused->mutable_operand(1);
   ASSERT_EQ(rhs->opcode(), HloOpcode::kConcatenate);
   EXPECT_EQ(rhs->concatenate_dimension(), 1);
-  // Operands are exactly B and C (order may be B,C).
   EXPECT_TRUE((rhs->operand(0) == B && rhs->operand(1) == C) ||
               (rhs->operand(0) == C && rhs->operand(1) == B));
 
-  // Slice shapes should match original O1/O2 shapes.
+  // Slice shapes match original O1/O2.
   EXPECT_TRUE(ShapeUtil::Compatible(s0->shape(), o1_s));
   EXPECT_TRUE(ShapeUtil::Compatible(s1->shape(), o2_s));
 
-  // Optional: count Dots in the computation (should be exactly 1).
+  // Slice index ranges are exactly [0:M, 0:N1] and [0:M, N1:N1+N2].
+  // (APIs exist on HloInstruction to read slice starts/limits.)
+  ASSERT_THAT(s0->slice_starts(), ::testing::ElementsAre(0, 0));
+  ASSERT_THAT(s0->slice_limits(), ::testing::ElementsAre(8, 10));
+  ASSERT_THAT(s1->slice_starts(), ::testing::ElementsAre(0, 10));
+  ASSERT_THAT(s1->slice_limits(), ::testing::ElementsAre(8, 17));
+
+  // Exactly one Dot in the computation.
   int dot_count = 0;
   for (HloInstruction* inst : computation->instructions()) {
     if (inst->opcode() == HloOpcode::kDot) ++dot_count;
