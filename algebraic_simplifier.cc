@@ -4160,11 +4160,10 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     HloInstruction* slice0 = make_slice(0,  N1);
     HloInstruction* slice1 = make_slice(N1, N1 + N2);
 
-    // Replace both dots
-    // Note: We replace other using ReplaceAllUsesWith which is safer than ReplaceInstruction
-    // when dealing with an instruction that might still be in the visitor's iteration.
+    // Replace all uses of both dots with their corresponding slices
     TF_RETURN_IF_ERROR(dot->ReplaceAllUsesWith(slice0));
     TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice1));
+    
     return absl::OkStatus();
   } while (false);
 
