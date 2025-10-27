@@ -4244,7 +4244,7 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice_for_other));
 
   VLOG(10) << "FUSION: other user_count after replacement=" << other->user_count();
-  TF_RETURN_IF_ERROR(comp->RemoveInstruction(other));
+  // TF_RETURN_IF_ERROR(comp->RemoveInstruction(other));
   VLOG(10) << "FUSION: marked other=" << other->name() << " with fusion marker";
 
   VLOG(10) << "FUSION: replacing dot=" << dot->name() << " with its slice";
