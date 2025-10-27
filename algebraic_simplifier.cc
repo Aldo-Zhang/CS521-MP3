@@ -4107,6 +4107,11 @@ AlgebraicSimplifierVisitor::MakeMultiplyForPrecisionAlgorithm(
 
 absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   CHECK(computation_ == dot->parent());
+
+  VLOG(10) << "HandleDot ENTER: " << dot->name() 
+           << " id=" << dot->unique_id()
+           << " shape=" << dot->shape().ToString();
+
   HloDotInstruction* dot_cast = Cast<HloDotInstruction>(dot);
   const auto& dnums = dot->dot_dimension_numbers();
 
@@ -4202,17 +4207,20 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
 
   // ---- Fuse Dot(A,B) and Dot(A,C) into Dot(A, concat(B,C, dim=1)) + slices ----
   {
+    VLOG(10) << "FUSION BLOCK: checking dot " << dot->name();
     if (dot->opcode() != HloOpcode::kDot || dot->shape().rank() != 2) goto FUSE_SKIP;
 
     if (dot->frontend_attributes().map().contains("_xla_fused_sibling_matmuls")) {
+      VLOG(10) << "FUSION SKIP: dot " << dot->name() << " already fused (has marker)";
       goto FUSE_SKIP;
-  }
+    }
     HloComputation* comp = dot->parent();
     if (comp == nullptr) goto FUSE_SKIP;
 
     HloInstruction* A = dot->mutable_operand(0);
     HloInstruction* B = dot->mutable_operand(1);
     if (!A || !B) goto FUSE_SKIP;
+    VLOG(10) << "FUSION: A=" << A->name() << " B=" << B->name();
     if (A->parent() != comp || B->parent() != comp) goto FUSE_SKIP;
     if (A->shape().rank() != 2 || B->shape().rank() != 2) goto FUSE_SKIP;
     if (B->opcode() == HloOpcode::kConcatenate) goto FUSE_SKIP;
@@ -4223,20 +4231,26 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
         dnums.rhs_contracting_dimensions_size() == 1 &&
         dnums.lhs_contracting_dimensions(0) == 1 &&
         dnums.rhs_contracting_dimensions(0) == 0;
-    if (!is_std_gemm) goto FUSE_SKIP;
+    if (!is_std_gemm) {VLOG(10) << "FUSION SKIP: not std gemm";goto FUSE_SKIP;}
+
+    VLOG(10) << "FUSION: searching for sibling dot sharing A=" << A->name();
 
     // Find sibling inside the SAME computation.
     HloInstruction* other = nullptr;
     HloInstruction* other_rhs = nullptr;
     for (HloInstruction* u : A->users()) {
+      VLOG(10) << "FUSION: checking A user: " << u->name() << " opcode=" << u->opcode();
       if (u == dot) continue;
       if (u->opcode() != HloOpcode::kDot) continue;
-      if (u->parent() != comp) continue;                      // same-comp guard
+      if (u->parent() != comp) {VLOG(10) << "FUSION: skip user " << u->name() << " (different comp)";continue;}
+      if (u->frontend_attributes().map().contains("_xla_fused_sibling_matmuls")) continue;                      // same-comp guard
       if (u->shape().rank() != 2) continue;
       if (u->dot_dimension_numbers().SerializeAsString() != dnums.SerializeAsString()) continue;
       if (u->precision_config().SerializeAsString() != dot->precision_config().SerializeAsString()) continue;
       if (u->operand(1)->shape().rank() != 2) continue;
       other = u;
+      other_rhs = u->mutable_operand(1);
+      VLOG(10) << "FUSION: found sibling other=" << other->name() << " id=" << other->unique_id();
       break;
     }
     if (other == nullptr) goto FUSE_SKIP;
