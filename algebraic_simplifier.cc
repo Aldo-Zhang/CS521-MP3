@@ -4204,6 +4204,9 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   {
     if (dot->opcode() != HloOpcode::kDot || dot->shape().rank() != 2) goto FUSE_SKIP;
 
+    if (dot->frontend_attributes().map().contains("_xla_fused_sibling_matmuls")) {
+      goto FUSE_SKIP;
+  }
     HloComputation* comp = dot->parent();
     if (comp == nullptr) goto FUSE_SKIP;
 
@@ -4275,7 +4278,10 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
         comp->AddInstruction(HloInstruction::CreateDot(fused_shape, A, rhs_concat, dnums,
                                                        dot->precision_config()));
     fused_dot->set_metadata(dot->metadata());
-    fused_dot->set_frontend_attributes(dot->frontend_attributes());
+
+    xla::FrontendAttributes attrs = fused_dot->frontend_attributes();
+    (*attrs.mutable_map())["_xla_fused_sibling_matmuls"] = "true";
+    fused_dot->set_frontend_attributes(attrs);
 
     auto make_slice = [&](int64_t cs, int64_t cl) {
       Shape s = ShapeUtil::MakeShape(out_ty, {M, cl - cs});
