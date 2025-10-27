@@ -4276,7 +4276,7 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
              << ", will fuse when processing other";
     goto FUSE_SKIP;
   }
-  
+
   if (other->user_count() == 0) goto FUSE_SKIP;
 
   // ⭐ 关键修复：判断谁的 ID 小，但不交换 dot（因为 dot 必须是当前访问的节点）
@@ -4342,10 +4342,10 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
 
   VLOG(10) << "FUSION: replacing other=" << other->name() << " with its slice";
   TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice_for_other));
-  if (other->user_count() == 0) {
-    VLOG(10) << "FUSION: removing dead other=" << other->name();
-    TF_RETURN_IF_ERROR(comp->RemoveInstruction(other));
-  }
+  xla::FrontendAttributes other_attrs = other->frontend_attributes();
+  (*other_attrs.mutable_map())["_xla_fused_sibling_matmuls"] = "true";
+  other->set_frontend_attributes(other_attrs);
+  VLOG(10) << "FUSION: marked other=" << other->name() << " with fusion marker";
 
   // ⭐ 替换当前节点（这个必须是原始的 dot，不能是交换后的）
   VLOG(10) << "FUSION: replacing dot=" << dot->name() << " with its slice";
