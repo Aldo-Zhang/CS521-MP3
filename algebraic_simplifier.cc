@@ -4220,6 +4220,10 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   //            RemoveDegenerateDimensionFromDot(dot_cast).
   {
     if (dot->opcode() == HloOpcode::kDot && dot->shape().rank() == 2) {
+      HloComputation* comp = dot->parent();   
+      if (comp == nullptr) {
+        return absl::OkStatus();
+      }
       HloInstruction* A = dot->mutable_operand(0);
       HloInstruction* B = dot->mutable_operand(1);
 
@@ -4254,6 +4258,11 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
           if (other != nullptr &&
               other->unique_id() >= dot->unique_id() &&  // anti double-fire
               other->user_count() > 0) {
+
+            if (other->parent() != comp) {
+              VLOG(10) << "Skip fuse: sibling dot is in a different computation.";
+              return absl::OkStatus();
+            }
             HloInstruction* C = other->mutable_operand(1);
             if (C->opcode() != HloOpcode::kConcatenate) {
               const Shape& a = A->shape();
