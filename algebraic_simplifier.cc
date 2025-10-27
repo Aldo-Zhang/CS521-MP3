@@ -5076,6 +5076,211 @@ absl::Status AlgebraicSimplifierVisitor::HandleMultiply(
     return absl::OkStatus();
   }
 
+  // Pattern: Recip(Conv(A,B)) * Recip(Mul(Conv(A,B), C)) => Recip(Square(Conv(A,B))) * Recip(C)
+  // This reduces convolution operations from 2 to 1
+  VLOG(10) << "trying transform [Recip(Conv) * Recip(Mul(Conv, C)) => Recip(Square(Conv)) * Recip(C)]: " 
+           << multiply->ToString();
+  
+  {
+    HloInstruction *recip_lhs, *recip_rhs;
+    HloInstruction *conv_in_lhs, *mul_result;
+    HloInstruction *conv_in_mul, *c_operand;
+    
+    // Match: Multiply(Reciprocal(Conv), Reciprocal(Multiply(Conv, C)))
+    // Note: We use Divide(1, X) pattern for reciprocal since XLA might represent it this way
+    if (Match(multiply, m::MultiplyAnyOrder(
+                          m::Op(&recip_lhs),
+                          m::Op(&recip_rhs)))) {
+      
+      // Check if both operands are reciprocals (either Power(x, -1) or Divide(1, x))
+      bool lhs_is_recip = false;
+      bool rhs_is_recip = false;
+      HloInstruction* lhs_recip_operand = nullptr;
+      HloInstruction* rhs_recip_operand = nullptr;
+      
+      // Check LHS for reciprocal pattern
+      if (recip_lhs->opcode() == HloOpcode::kPower) {
+        HloInstruction* exponent = recip_lhs->mutable_operand(1);
+        if (IsAll(exponent, -1)) {
+          lhs_is_recip = true;
+          lhs_recip_operand = recip_lhs->mutable_operand(0);
+        }
+      } else if (recip_lhs->opcode() == HloOpcode::kDivide) {
+        HloInstruction* numerator = recip_lhs->mutable_operand(0);
+        if (IsAll(numerator, 1)) {
+          lhs_is_recip = true;
+          lhs_recip_operand = recip_lhs->mutable_operand(1);
+        }
+      }
+      
+      // Check RHS for reciprocal pattern
+      if (recip_rhs->opcode() == HloOpcode::kPower) {
+        HloInstruction* exponent = recip_rhs->mutable_operand(1);
+        if (IsAll(exponent, -1)) {
+          rhs_is_recip = true;
+          rhs_recip_operand = recip_rhs->mutable_operand(0);
+        }
+      } else if (recip_rhs->opcode() == HloOpcode::kDivide) {
+        HloInstruction* numerator = recip_rhs->mutable_operand(0);
+        if (IsAll(numerator, 1)) {
+          rhs_is_recip = true;
+          rhs_recip_operand = recip_rhs->mutable_operand(1);
+        }
+      }
+      
+      if (!lhs_is_recip || !rhs_is_recip) {
+        VLOG(10) << "ASSOCIATIVE: Not both reciprocals";
+        goto SKIP_ASSOCIATIVE;
+      }
+      
+      VLOG(10) << "ASSOCIATIVE: Found two reciprocals";
+      
+      // Now check if one is Conv and the other is Multiply(Conv, C)
+      HloInstruction* conv_op = nullptr;
+      HloInstruction* mul_op = nullptr;
+      bool conv_in_lhs_recip = false;
+      
+      // Case 1: LHS is Conv, RHS is Multiply
+      if (lhs_recip_operand->opcode() == HloOpcode::kConvolution &&
+          rhs_recip_operand->opcode() == HloOpcode::kMultiply) {
+        conv_op = lhs_recip_operand;
+        mul_op = rhs_recip_operand;
+        conv_in_lhs_recip = true;
+      }
+      // Case 2: RHS is Conv, LHS is Multiply
+      else if (rhs_recip_operand->opcode() == HloOpcode::kConvolution &&
+               lhs_recip_operand->opcode() == HloOpcode::kMultiply) {
+        conv_op = rhs_recip_operand;
+        mul_op = lhs_recip_operand;
+        conv_in_lhs_recip = false;
+      } else {
+        VLOG(10) << "ASSOCIATIVE: Pattern doesn't match Conv and Multiply";
+        goto SKIP_ASSOCIATIVE;
+      }
+      
+      VLOG(10) << "ASSOCIATIVE: Found Conv=" << conv_op->name() 
+               << " and Multiply=" << mul_op->name();
+      
+      // Check if the Multiply contains the same Conv
+      HloInstruction* mul_lhs = mul_op->mutable_operand(0);
+      HloInstruction* mul_rhs = mul_op->mutable_operand(1);
+      
+      HloInstruction* conv_in_mul_actual = nullptr;
+      HloInstruction* c_actual = nullptr;
+      
+      if (mul_lhs == conv_op) {
+        conv_in_mul_actual = mul_lhs;
+        c_actual = mul_rhs;
+      } else if (mul_rhs == conv_op) {
+        conv_in_mul_actual = mul_rhs;
+        c_actual = mul_lhs;
+      } else {
+        VLOG(10) << "ASSOCIATIVE: Multiply doesn't contain the same Conv";
+        goto SKIP_ASSOCIATIVE;
+      }
+      
+      VLOG(10) << "ASSOCIATIVE: Conv appears in both places, C=" << c_actual->name();
+      
+      // Check if operations have single users (for safe transformation)
+      if (recip_lhs->user_count() != 1 || recip_rhs->user_count() != 1) {
+        VLOG(10) << "ASSOCIATIVE: Reciprocal operations have multiple users";
+        goto SKIP_ASSOCIATIVE;
+      }
+      
+      if (mul_op->user_count() != 1) {
+        VLOG(10) << "ASSOCIATIVE: Multiply operation has multiple users";
+        goto SKIP_ASSOCIATIVE;
+      }
+      
+      // Verify shapes are compatible
+      if (!ShapeUtil::Compatible(conv_op->shape(), c_actual->shape())) {
+        VLOG(10) << "ASSOCIATIVE: Shape mismatch between Conv and C";
+        goto SKIP_ASSOCIATIVE;
+      }
+      
+      VLOG(10) << "ASSOCIATIVE: All preconditions met, applying transformation";
+      
+      // Build the rewritten expression: Recip(Square(Conv)) * Recip(C)
+      
+      // Create Square(Conv) = Conv * Conv
+      HloInstruction* square_conv = computation_->AddInstruction(
+          HloInstruction::CreateBinary(
+              conv_op->shape(), HloOpcode::kMultiply, conv_op, conv_op));
+      
+      // Create Recip(Square(Conv))
+      // Use the same reciprocal representation as the original
+      HloInstruction* recip_square;
+      if (recip_lhs->opcode() == HloOpcode::kPower) {
+        // Use Power(x, -1)
+        HloInstruction* minus_one = computation_->AddInstruction(
+            HloInstruction::CreateConstant(
+                LiteralUtil::CreateR0<float>(-1.0f)));
+        if (!ShapeUtil::IsScalar(square_conv->shape())) {
+          minus_one = computation_->AddInstruction(
+              HloInstruction::CreateBroadcast(
+                  square_conv->shape(), minus_one, {}));
+        }
+        recip_square = computation_->AddInstruction(
+            HloInstruction::CreateBinary(
+                square_conv->shape(), HloOpcode::kPower, square_conv, minus_one));
+      } else {
+        // Use Divide(1, x)
+        HloInstruction* one = computation_->AddInstruction(
+            HloInstruction::CreateConstant(
+                LiteralUtil::CreateR0<float>(1.0f)));
+        if (!ShapeUtil::IsScalar(square_conv->shape())) {
+          one = computation_->AddInstruction(
+              HloInstruction::CreateBroadcast(
+                  square_conv->shape(), one, {}));
+        }
+        recip_square = computation_->AddInstruction(
+            HloInstruction::CreateBinary(
+                square_conv->shape(), HloOpcode::kDivide, one, square_conv));
+      }
+      
+      // Create Recip(C)
+      HloInstruction* recip_c;
+      if (recip_lhs->opcode() == HloOpcode::kPower) {
+        HloInstruction* minus_one = computation_->AddInstruction(
+            HloInstruction::CreateConstant(
+                LiteralUtil::CreateR0<float>(-1.0f)));
+        if (!ShapeUtil::IsScalar(c_actual->shape())) {
+          minus_one = computation_->AddInstruction(
+              HloInstruction::CreateBroadcast(
+                  c_actual->shape(), minus_one, {}));
+        }
+        recip_c = computation_->AddInstruction(
+            HloInstruction::CreateBinary(
+                c_actual->shape(), HloOpcode::kPower, c_actual, minus_one));
+      } else {
+        HloInstruction* one = computation_->AddInstruction(
+            HloInstruction::CreateConstant(
+                LiteralUtil::CreateR0<float>(1.0f)));
+        if (!ShapeUtil::IsScalar(c_actual->shape())) {
+          one = computation_->AddInstruction(
+              HloInstruction::CreateBroadcast(
+                  c_actual->shape(), one, {}));
+        }
+        recip_c = computation_->AddInstruction(
+            HloInstruction::CreateBinary(
+                c_actual->shape(), HloOpcode::kDivide, one, c_actual));
+      }
+      
+      // Create final Multiply: Recip(Square(Conv)) * Recip(C)
+      HloInstruction* final_mul = computation_->AddInstruction(
+          HloInstruction::CreateBinary(
+              multiply->shape(), HloOpcode::kMultiply, recip_square, recip_c));
+      
+      VLOG(10) << "ASSOCIATIVE: Created optimized expression: " << final_mul->name();
+      
+      return ReplaceInstruction(multiply, final_mul);
+    }
+  }
+  
+SKIP_ASSOCIATIVE:
+  VLOG(10) << "ASSOCIATIVE: Pattern not matched or preconditions not met";
+  // ========== End of DNNFusion Associative Rule ==========
+
   {
     // Mul(Negate(A), Negate(B)) => Mul(A, B)
     HloInstruction *a, *b;
