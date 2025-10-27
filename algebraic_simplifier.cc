@@ -878,46 +878,35 @@ absl::Status AlgebraicSimplifierVisitor::HandleAdd(HloInstruction* add) {
   }
 
   // (x / y) + (z / y)  ==>  (x + z) / y
-  VLOG(10) << "trying transform [(x / y) + (z / y) => (x + z) / y]: " << add->ToString();
-  HloInstruction *x, *z;
-  HloInstruction *den0, *den1; 
-  if (!Match(add,
-            m::Add(
-              m::Divide(m::Op(&x), m::Op(&den0)),
-              m::Divide(m::Op(&z), m::Op(&den1))))) {
-    return absl::OkStatus();
-  }
+VLOG(10) << "trying transform [(x / y) + (z / y) => (x + z) / y]: " << add->ToString();
+HloInstruction *x, *z;
+HloInstruction *den0, *den1; 
+if (!Match(add,
+          m::Add(
+            m::Divide(m::Op(&x), m::Op(&den0)),
+            m::Divide(m::Op(&z), m::Op(&den1))))) {
+  return absl::OkStatus();
+}
 
-  auto src = [](HloInstruction* den) -> HloInstruction* {
-    return den->opcode() == HloOpcode::kBroadcast ? den->mutable_operand(0) : den;
-  };
-  HloInstruction* ys0 = src(den0);
-  HloInstruction* ys1 = src(den1);
+auto src = [](HloInstruction* den) -> HloInstruction* {
+  return den->opcode() == HloOpcode::kBroadcast ? den->mutable_operand(0) : den;
+};
+HloInstruction* ys0 = src(den0);
+HloInstruction* ys1 = src(den1);
 
-  if (ys0 != ys1 || !ShapeUtil::IsScalar(ys0->shape())) return absl::OkStatus();
+if (ys0 != ys1 || !ShapeUtil::IsScalar(ys0->shape())) return absl::OkStatus();
 
-  // Assert that x and z has the same shape
-  if (!ShapeUtil::Compatible(x->shape(), z->shape())) return absl::OkStatus();
+if (!ShapeUtil::Compatible(x->shape(), z->shape())) return absl::OkStatus();
 
-  auto* comp = add->parent();
-  auto* x_plus_z = comp->AddInstruction(
-      HloInstruction::CreateBinary(x->shape(), HloOpcode::kAdd, x, z));
+auto* comp = add->parent();
+auto* x_plus_z = comp->AddInstruction(
+    HloInstruction::CreateBinary(x->shape(), HloOpcode::kAdd, x, z));
 
-  HloInstruction* broadcast_denom;
-  if (den0->opcode() == HloOpcode::kBroadcast && 
-      ShapeUtil::Compatible(den0->shape(), x->shape())) {
-    broadcast_denom = den0;
-  } else if (den1->opcode() == HloOpcode::kBroadcast && 
-            ShapeUtil::Compatible(den1->shape(), x->shape())) {
-    broadcast_denom = den1;
-  } else {
-    broadcast_denom = comp->AddInstruction(
-        HloInstruction::CreateBroadcast(x->shape(), ys0, {}));
-  }
+HloInstruction* denom = ys0;
 
-  return ReplaceWithNewInstruction(
-      add, HloInstruction::CreateBinary(add->shape(), HloOpcode::kDivide,
-                                        x_plus_z, broadcast_denom));
+return ReplaceWithNewInstruction(
+    add, HloInstruction::CreateBinary(add->shape(), HloOpcode::kDivide,
+                                      x_plus_z, denom));
 
   // Canonicalization: Put constants on the right.  This makes the reassociation
   // rules below simpler.
