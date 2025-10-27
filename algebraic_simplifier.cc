@@ -4118,8 +4118,10 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     goto FUSE_SKIP;
   }
   
-  HloComputation* comp = dot->parent();
+  HloComputation* comp = computation_; // Use the computation graph from visitor
   if (comp == nullptr) goto FUSE_SKIP;
+
+  if (dot->parent() != comp) goto FUSE_SKIP;
 
   HloInstruction* A = dot->mutable_operand(0);
   HloInstruction* B = dot->mutable_operand(1);
@@ -4182,8 +4184,6 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
 
   if (other->user_count() == 0) goto FUSE_SKIP;
 
-  // ⭐ 关键修复：判断谁的 ID 小，但不交换 dot（因为 dot 必须是当前访问的节点）
-  // 只交换 RHS，并记住 concat 的顺序
   HloInstruction* C = other_rhs;
   if (!C || C->parent() != comp) goto FUSE_SKIP;
   if (C->shape().rank() != 2) goto FUSE_SKIP;
@@ -4202,7 +4202,6 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   const int64_t N1 = b.dimensions(1);
   const int64_t N2 = c.dimensions(1);
 
-  // ⭐ 根据 ID 决定 concat 顺序和 slice 分配
   bool dot_is_first = dot->unique_id() < other->unique_id();
   
   HloInstruction* first_rhs = dot_is_first ? B : C;
@@ -4214,7 +4213,6 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
            << " first_rhs=" << first_rhs->name() 
            << " second_rhs=" << second_rhs->name();
 
-  // RHS = concat(first, second) 按 ID 顺序
   Shape rhs_shape = ShapeUtil::MakeShape(b.element_type(), {K, N_first + N_second});
   HloInstruction* rhs_concat = comp->AddInstruction(
       HloInstruction::CreateConcatenate(rhs_shape, {first_rhs, second_rhs}, /*dimension=*/1));
@@ -4239,19 +4237,16 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   HloInstruction* slice_for_first = make_slice(0, N_first);
   HloInstruction* slice_for_second = make_slice(N_first, N_first + N_second);
 
-  // ⭐ 根据 ID 关系分配 slice
   HloInstruction* slice_for_dot = dot_is_first ? slice_for_first : slice_for_second;
   HloInstruction* slice_for_other = dot_is_first ? slice_for_second : slice_for_first;
 
   VLOG(10) << "FUSION: replacing other=" << other->name() << " with its slice";
   TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice_for_other));
-  // ⭐ 直接删除 other（不需要标记）
+
   VLOG(10) << "FUSION: other user_count after replacement=" << other->user_count();
   TF_RETURN_IF_ERROR(comp->RemoveInstruction(other));
-  VLOG(10) << "FUSION: removed other=" << other->name();
   VLOG(10) << "FUSION: marked other=" << other->name() << " with fusion marker";
 
-  // ⭐ 替换当前节点（这个必须是原始的 dot，不能是交换后的）
   VLOG(10) << "FUSION: replacing dot=" << dot->name() << " with its slice";
   TF_RETURN_IF_ERROR(ReplaceInstruction(dot, slice_for_dot));
   
