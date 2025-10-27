@@ -878,35 +878,44 @@ absl::Status AlgebraicSimplifierVisitor::HandleAdd(HloInstruction* add) {
   }
 
   // (x / y) + (z / y)  ==>  (x + z) / y
-VLOG(10) << "trying transform [(x / y) + (z / y) => (x + z) / y]: " << add->ToString();
-HloInstruction *x, *z;
-HloInstruction *den0, *den1; 
-if (!Match(add,
-          m::Add(
-            m::Divide(m::Op(&x), m::Op(&den0)),
-            m::Divide(m::Op(&z), m::Op(&den1))))) {
-  return absl::OkStatus();
-}
+  VLOG(10) << "trying transform [(x / y) + (z / y) => (x + z) / y]: " << add->ToString();
+  HloInstruction *x, *z, *den0, *den1; 
+  if (Match(add, m::Add(
+              m::Divide(m::Op(&x), m::Op(&den0)),
+              m::Divide(m::Op(&z), m::Op(&den1))))) {
 
-auto src = [](HloInstruction* den) -> HloInstruction* {
-  return den->opcode() == HloOpcode::kBroadcast ? den->mutable_operand(0) : den;
-};
-HloInstruction* ys0 = src(den0);
-HloInstruction* ys1 = src(den1);
+    auto src = [](HloInstruction* den) -> HloInstruction* {
+      return den->opcode() == HloOpcode::kBroadcast ? den->mutable_operand(0) : den;
+    };
+    HloInstruction* ys0 = src(den0);
+    HloInstruction* ys1 = src(den1);
 
-if (ys0 != ys1 || !ShapeUtil::IsScalar(ys0->shape())) return absl::OkStatus();
+    if (ys0 != ys1 || !ShapeUtil::IsScalar(ys0->shape())) return absl::OkStatus();
 
-if (!ShapeUtil::Compatible(x->shape(), z->shape())) return absl::OkStatus();
+    // Assert that x and z has the same shape and rank 
+    if (!ShapeUtil::Compatible(x->shape(), z->shape())) return absl::OkStatus();
 
-auto* comp = add->parent();
-auto* x_plus_z = comp->AddInstruction(
-    HloInstruction::CreateBinary(x->shape(), HloOpcode::kAdd, x, z));
+    auto* comp = add->parent();
+    auto* x_plus_z = comp->AddInstruction(
+        HloInstruction::CreateBinary(x->shape(), HloOpcode::kAdd, x, z));
+    
+    // Check denom, if any one has been broadcasted, use it, otherwise broadcast one
+    HloInstruction* denom = nullptr;
+    if (den0->opcode() == HloOpcode::kBroadcast &&
+        ShapeUtil::Compatible(den0->shape(), x->shape())) {
+      denom = den0;
+    } else if (den1->opcode() == HloOpcode::kBroadcast &&
+              ShapeUtil::Compatible(den1->shape(), x->shape())) {
+      denom = den1;
+    } else {
+      denom = comp->AddInstruction(
+          HloInstruction::CreateBroadcast(x->shape(), ys0, /*broadcast_dimensions=*/{}));
+    }
 
-HloInstruction* denom = ys0;
-
-return ReplaceWithNewInstruction(
-    add, HloInstruction::CreateBinary(add->shape(), HloOpcode::kDivide,
-                                      x_plus_z, denom));
+    return ReplaceWithNewInstruction(
+        add, HloInstruction::CreateBinary(add->shape(), HloOpcode::kDivide,
+                                          x_plus_z, denom));
+  }
 
   // Canonicalization: Put constants on the right.  This makes the reassociation
   // rules below simpler.
@@ -4270,18 +4279,17 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     goto FUSE_SKIP;
   }
 
-  if (dot->unique_id() < other->unique_id()) {
+  if (dot->unique_id() > other->unique_id()) {
     VLOG(10) << "FUSION SKIP: dot id=" << dot->unique_id() 
-            << " < other id=" << other->unique_id() 
-            << ", will fuse when processing dot later";
+             << " > other id=" << other->unique_id() 
+             << ", will fuse when processing other";
     goto FUSE_SKIP;
   }
 
-  VLOG(10) << "FUSION: dot (id=" << dot->unique_id() << ") > other (id=" 
-          << other->unique_id() << "), proceeding with fusion";
-
   if (other->user_count() == 0) goto FUSE_SKIP;
 
+  // ⭐ 关键修复：判断谁的 ID 小，但不交换 dot（因为 dot 必须是当前访问的节点）
+  // 只交换 RHS，并记住 concat 的顺序
   HloInstruction* C = other_rhs;
   if (!C || C->parent() != comp) goto FUSE_SKIP;
   if (C->shape().rank() != 2) goto FUSE_SKIP;
@@ -4297,20 +4305,29 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
 
   const int64_t M  = a.dimensions(0);
   const int64_t K  = a.dimensions(1);
-  const int64_t N_other = c.dimensions(1);  // other 
-  const int64_t N_dot = b.dimensions(1);    // dot 
+  const int64_t N1 = b.dimensions(1);
+  const int64_t N2 = c.dimensions(1);
 
-  VLOG(10) << "FUSION: M=" << M << " K=" << K 
-          << " N_other=" << N_other << " N_dot=" << N_dot;
+  // ⭐ 根据 ID 决定 concat 顺序和 slice 分配
+  bool dot_is_first = dot->unique_id() < other->unique_id();
+  
+  HloInstruction* first_rhs = dot_is_first ? B : C;
+  HloInstruction* second_rhs = dot_is_first ? C : B;
+  int64_t N_first = dot_is_first ? N1 : N2;
+  int64_t N_second = dot_is_first ? N2 : N1;
 
-  Shape rhs_shape = ShapeUtil::MakeShape(b.element_type(), {K, N_other + N_dot});
+  VLOG(10) << "FUSION: dot_is_first=" << dot_is_first 
+           << " first_rhs=" << first_rhs->name() 
+           << " second_rhs=" << second_rhs->name();
+
+  // RHS = concat(first, second) 按 ID 顺序
+  Shape rhs_shape = ShapeUtil::MakeShape(b.element_type(), {K, N_first + N_second});
   HloInstruction* rhs_concat = comp->AddInstruction(
-      HloInstruction::CreateConcatenate(rhs_shape, {C, B}, /*dimension=*/1));
-  VLOG(10) << "FUSION: created concat(C, B)";
+      HloInstruction::CreateConcatenate(rhs_shape, {first_rhs, second_rhs}, /*dimension=*/1));
 
   // Fused dot
   const PrimitiveType out_ty = dot->shape().element_type();
-  Shape fused_shape = ShapeUtil::MakeShape(out_ty, {M, N_other + N_dot});
+  Shape fused_shape = ShapeUtil::MakeShape(out_ty, {M, N_first + N_second});
   HloInstruction* fused_dot = comp->AddInstruction(
       HloInstruction::CreateDot(fused_shape, A, rhs_concat, dnums, dot->precision_config()));
   fused_dot->set_metadata(dot->metadata());
@@ -4324,27 +4341,29 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     return comp->AddInstruction(HloInstruction::CreateSlice(
         s, fused_dot, /*start_indices=*/{0, cs}, /*limit_indices=*/{M, cl}, /*strides=*/{1, 1}));
   };
+  
+  HloInstruction* slice_for_first = make_slice(0, N_first);
+  HloInstruction* slice_for_second = make_slice(N_first, N_first + N_second);
 
-  HloInstruction* slice_for_other = make_slice(0, N_other);
-  HloInstruction* slice_for_dot = make_slice(N_other, N_other + N_dot);
-  VLOG(10) << "FUSION: slice_for_other=[0:" << N_other 
-          << "], slice_for_dot=[" << N_other << ":" << (N_other + N_dot) << "]";
+  // ⭐ 根据 ID 关系分配 slice
+  HloInstruction* slice_for_dot = dot_is_first ? slice_for_first : slice_for_second;
+  HloInstruction* slice_for_other = dot_is_first ? slice_for_second : slice_for_first;
 
-  VLOG(10) << "FUSION: replacing other=" << other->name();
+  VLOG(10) << "FUSION: replacing other=" << other->name() << " with its slice";
   TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice_for_other));
+  // ⭐ 直接删除 other（不需要标记）
+  VLOG(10) << "FUSION: other user_count after replacement=" << other->user_count();
+  TF_RETURN_IF_ERROR(comp->RemoveInstruction(other));
+  VLOG(10) << "FUSION: removed other=" << other->name();
+  VLOG(10) << "FUSION: marked other=" << other->name() << " with fusion marker";
 
-  if (other->user_count() == 0) {
-    VLOG(10) << "FUSION: removing other (already visited)";
-    TF_RETURN_IF_ERROR(comp->RemoveInstruction(other));
-  }
-
-  // Replace current dot
-  VLOG(10) << "FUSION: replacing dot=" << dot->name();
+  // ⭐ 替换当前节点（这个必须是原始的 dot，不能是交换后的）
+  VLOG(10) << "FUSION: replacing dot=" << dot->name() << " with its slice";
   TF_RETURN_IF_ERROR(ReplaceInstruction(dot, slice_for_dot));
-
-  VLOG(10) << "FUSION SUCCESS!";
+  
+  VLOG(10) << "FUSION SUCCESS: fused two sibling matmuls";
   return absl::OkStatus();
-  }
+}
 FUSE_SKIP:
   VLOG(10) << "FUSION SKIP label reached";
   // ---- end fusion block ----
