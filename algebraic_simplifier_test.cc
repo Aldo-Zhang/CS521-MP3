@@ -7560,10 +7560,15 @@ TEST_F(AlgebraicSimplifierTest, FuseTwoMatmuls_ConcatAndSplit) {
   b.AddInstruction(HloInstruction::CreateTuple({O1, O2}));
   auto* computation = m->AddEntryComputationWithLayouts(b.Build());
 
+  LOG(INFO) << "Before simplification:\n" << m->ToString();
+
+
   // IMPORTANT: run the pass via helper to keep visitor/computation_ in sync.
   AlgebraicSimplifierOptions opts = default_options_;
   AlgebraicSimplifier simplifier(opts);
   TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
+
+  LOG(INFO) << "After simplification (changed=" << changed << "):\n" << m->ToString();
   ASSERT_TRUE(changed);
 
   // Root stays a tuple of two slices.
