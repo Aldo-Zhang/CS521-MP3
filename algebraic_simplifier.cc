@@ -4224,6 +4224,7 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
 
     // Find sibling inside the SAME computation.
     HloInstruction* other = nullptr;
+    HloInstruction* other_rhs = nullptr;
     for (HloInstruction* u : A->users()) {
       if (u == dot) continue;
       if (u->opcode() != HloOpcode::kDot) continue;
@@ -4236,10 +4237,15 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
       break;
     }
     if (other == nullptr) goto FUSE_SKIP;
-    if (other->unique_id() > dot->unique_id()) goto FUSE_SKIP; // anti double-fire
-    if (other->user_count() == 0) goto FUSE_SKIP;
+    // if (other->unique_id() > dot->unique_id()) goto FUSE_SKIP; // anti double-fire
+    // if (other->user_count() == 0) goto FUSE_SKIP;
+    if (other->unique_id() < dot->unique_id()) {
+      std::swap(dot, other);
+      std::swap(B, other_rhs);
+    }
 
-    HloInstruction* C = other->mutable_operand(1);
+    // HloInstruction* C = other->mutable_operand(1);
+    HloInstruction* C = other_rhs; 
     if (!C || C->parent() != comp) goto FUSE_SKIP;             // same-comp guard
     if (C->shape().rank() != 2) goto FUSE_SKIP;
     if (C->opcode() == HloOpcode::kConcatenate) goto FUSE_SKIP;
