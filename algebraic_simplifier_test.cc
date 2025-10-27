@@ -1725,7 +1725,7 @@ TEST_F(AlgebraicSimplifierTest, DistDivScalar) {
     // OK: implicit broadcast
   } else {
     ASSERT_EQ(den->opcode(), HloOpcode::kBroadcast);
-    EXPECT_EQ(den->operand(0), y);  // broadcast 来源必须是 y
+    EXPECT_EQ(den->operand(0), y);
   }
 }
 
