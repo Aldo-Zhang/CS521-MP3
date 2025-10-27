@@ -4269,6 +4269,14 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     VLOG(10) << "FUSION SKIP: no sibling found";
     goto FUSE_SKIP;
   }
+
+  if (dot->unique_id() > other->unique_id()) {
+    VLOG(10) << "FUSION SKIP: dot id=" << dot->unique_id() 
+             << " > other id=" << other->unique_id() 
+             << ", will fuse when processing other";
+    goto FUSE_SKIP;
+  }
+  
   if (other->user_count() == 0) goto FUSE_SKIP;
 
   // ⭐ 关键修复：判断谁的 ID 小，但不交换 dot（因为 dot 必须是当前访问的节点）
