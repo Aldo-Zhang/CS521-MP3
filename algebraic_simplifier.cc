@@ -4201,31 +4201,16 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   }
 
   // ---- Fuse Dot(A,B) and Dot(A,C) into Dot(A, concat(B,C, dim=1)) + slices ----
-  // Preconditions:
-  //  * dot is 2D GEMM: lhs_contract=1, rhs_contract=0
-  //  * A,B,C are rank-2
-  //  * B and C are NOT already Concatenate (avoid cascading)
-  //  * Same DotDimensionNumbers and PrecisionConfig on both dots
-  //  * K matches; element types are consistent
-  //  * Use unique_id() to avoid double-firing
-  //
-  // IMPORTANT:
-  //  * All IR mutations are performed on dot->parent() (never on a cached computation_).
-  //  * For the non-current node `other`, use ReplaceAllUsesWith() (do not replace the node
-  //    object here). Then, if it has no users, RemoveInstruction(other).
-  //  * For the current node `dot`, use the visitor's ReplaceInstruction(...) so the pass
-  //    correctly reports `changed = true`.
-  //
-  // Placement: right after OptimizeDotOfGather(dot) and before
-  //            RemoveDegenerateDimensionFromDot(dot_cast).
   {
     if (dot->opcode() == HloOpcode::kDot && dot->shape().rank() == 2) {
-      HloComputation* comp = dot->parent();   
-      if (comp == nullptr) {
-        return absl::OkStatus();
-      }
+      HloComputation* comp = dot->parent();
+      if (comp == nullptr) goto FUSE_SKIP;  // defensive: do not early-return
+
       HloInstruction* A = dot->mutable_operand(0);
       HloInstruction* B = dot->mutable_operand(1);
+
+      // All must belong to the same computation as 'dot'.
+      if (A->parent() != comp || B->parent() != comp) goto FUSE_SKIP;
 
       if (A->shape().rank() == 2 && B->shape().rank() == 2 &&
           B->opcode() != HloOpcode::kConcatenate) {
@@ -4243,13 +4228,9 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
             if (u == dot || u->opcode() != HloOpcode::kDot) continue;
             if (u->shape().rank() != 2) continue;
             if (u->dot_dimension_numbers().SerializeAsString() !=
-                dnums.SerializeAsString()) {
-              continue;
-            }
+                dnums.SerializeAsString()) continue;
             if (u->precision_config().SerializeAsString() !=
-                dot->precision_config().SerializeAsString()) {
-              continue;
-            }
+                dot->precision_config().SerializeAsString()) continue;
             if (u->operand(1)->shape().rank() != 2) continue;
             other = u;
             break;
@@ -4259,85 +4240,83 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
               other->unique_id() >= dot->unique_id() &&  // anti double-fire
               other->user_count() > 0) {
 
-            if (other->parent() != comp) {
-              VLOG(10) << "Skip fuse: sibling dot is in a different computation.";
-              return absl::OkStatus();
-            }
+            // Hard guard: sibling must be in the same computation.
+            if (other->parent() != comp) goto FUSE_SKIP;
+
             HloInstruction* C = other->mutable_operand(1);
-            if (C->opcode() != HloOpcode::kConcatenate) {
-              const Shape& a = A->shape();
-              const Shape& b = B->shape();
-              const Shape& c = C->shape();
+            if (C->parent() != comp) goto FUSE_SKIP;  // same-comp guard
+            if (C->shape().rank() != 2) goto FUSE_SKIP;
+            if (C->opcode() == HloOpcode::kConcatenate) goto FUSE_SKIP;
 
-              // K must match.
-              if (a.dimensions(1) == b.dimensions(0) &&
-                  a.dimensions(1) == c.dimensions(0)) {
-                // Element types: inputs consistent; outputs consistent.
-                if (a.element_type() == b.element_type() &&
-                    a.element_type() == c.element_type() &&
-                    dot->shape().element_type() ==
-                        other->shape().element_type()) {
-                  const int64_t M  = a.dimensions(0);
-                  const int64_t K  = a.dimensions(1);
-                  const int64_t N1 = b.dimensions(1);
-                  const int64_t N2 = c.dimensions(1);
+            const Shape& a = A->shape();
+            const Shape& b = B->shape();
+            const Shape& c = C->shape();
 
-                  HloComputation* comp = dot->parent();
-                  const PrimitiveType out_ty = dot->shape().element_type();
-
-                  // RHS = concatenate(B, C) along N (dim=1); fixed order (B,C) for determinism.
-                  Shape rhs_shape =
-                      ShapeUtil::MakeShape(b.element_type(), {K, N1 + N2});
-                  HloInstruction* rhs_concat =
-                      comp->AddInstruction(HloInstruction::CreateConcatenate(
-                          rhs_shape, {B, C}, /*dimension=*/1));
-
-                  // Fused dot: out dtype = original dot's output dtype.
-                  Shape fused_shape =
-                      ShapeUtil::MakeShape(out_ty, {M, N1 + N2});
-                  HloInstruction* fused_dot =
-                      comp->AddInstruction(HloInstruction::CreateDot(
-                          fused_shape, A, rhs_concat, dnums,
-                          dot->precision_config()));
-                  fused_dot->set_metadata(dot->metadata());
-                  fused_dot->set_frontend_attributes(dot->frontend_attributes());
-
-                  // Two slices: [0:N1] and [N1:N1+N2].
-                  auto make_slice = [&](int64_t col_start, int64_t col_limit) {
-                    Shape s = ShapeUtil::MakeShape(out_ty,
-                                                   {M, col_limit - col_start});
-                    return comp->AddInstruction(HloInstruction::CreateSlice(
-                        s, fused_dot,
-                        /*start_indices=*/{0, col_start},
-                        /*limit_indices=*/{M, col_limit},
-                        /*strides=*/{1, 1}));
-                  };
-                  HloInstruction* slice0 = make_slice(/*0*/ 0, /*N1*/ N1);
-                  HloInstruction* slice1 =
-                      make_slice(/*N1*/ N1, /*N1+N2*/ N1 + N2);
-
-                  // 1) Rewire 'other' first by uses (do NOT replace the node object here).
-                  TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice1));
-
-                  // 2) Replace the current node 'dot' through the visitor API,
-                  //    so the pass correctly reports changed=true.
-                  TF_RETURN_IF_ERROR(ReplaceInstruction(dot, slice0));
-
-                  // 3) If 'other' is now dead, remove it.
-                  if (other->user_count() == 0) {
-                    TF_RETURN_IF_ERROR(comp->RemoveInstruction(other));
-                  }
-
-                  VLOG(10) << "Fused two sibling matmuls via concat+slice.";
-                  return absl::OkStatus();  // only return when rewritten
-                }
-              }
+            // K must match.
+            if (!(a.dimensions(1) == b.dimensions(0) &&
+                  a.dimensions(1) == c.dimensions(0))) {
+              goto FUSE_SKIP;
             }
+
+            // Input element types must match; output element types must match.
+            if (!(a.element_type() == b.element_type() &&
+                  a.element_type() == c.element_type() &&
+                  dot->shape().element_type() ==
+                      other->shape().element_type())) {
+              goto FUSE_SKIP;
+            }
+
+            const int64_t M  = a.dimensions(0);
+            const int64_t K  = a.dimensions(1);
+            const int64_t N1 = b.dimensions(1);
+            const int64_t N2 = c.dimensions(1);
+
+            // RHS = concatenate(B, C) along N (dim=1) in fixed order (B,C).
+            Shape rhs_shape =
+                ShapeUtil::MakeShape(b.element_type(), {K, N1 + N2});
+            HloInstruction* rhs_concat =
+                comp->AddInstruction(HloInstruction::CreateConcatenate(
+                    rhs_shape, {B, C}, /*dimension=*/1));
+
+            // Fused dot; output dtype = original dot's output dtype.
+            const PrimitiveType out_ty = dot->shape().element_type();
+            Shape fused_shape =
+                ShapeUtil::MakeShape(out_ty, {M, N1 + N2});
+            HloInstruction* fused_dot =
+                comp->AddInstruction(HloInstruction::CreateDot(
+                    fused_shape, A, rhs_concat, dnums, dot->precision_config()));
+            fused_dot->set_metadata(dot->metadata());
+            fused_dot->set_frontend_attributes(dot->frontend_attributes());
+
+            // Two slices: [0:N1] and [N1:N1+N2].
+            auto make_slice = [&](int64_t col_start, int64_t col_limit) {
+              Shape s = ShapeUtil::MakeShape(out_ty, {M, col_limit - col_start});
+              return comp->AddInstruction(HloInstruction::CreateSlice(
+                  s, fused_dot,
+                  /*start_indices=*/{0, col_start},
+                  /*limit_indices=*/{M, col_limit},
+                  /*strides=*/{1, 1}));
+            };
+            HloInstruction* slice0 = make_slice(0,  N1);
+            HloInstruction* slice1 = make_slice(N1, N1 + N2);
+
+            // Rewire 'other' by uses (do NOT replace the node object here).
+            TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice1));
+            if (other->user_count() == 0) {
+              // Same-comp delete is safe now.
+              TF_RETURN_IF_ERROR(comp->RemoveInstruction(other));
+            }
+
+            // Replace current node via visitor API (marks changed=true).
+            TF_RETURN_IF_ERROR(ReplaceInstruction(dot, slice0));
+            VLOG(10) << "Fused two sibling matmuls via concat+slice.";
+            return absl::OkStatus();  // stop after rewrite
           }
         }
       }
     }
   }
+FUSE_SKIP:
   // ---- end fusion block ----
   
   TF_ASSIGN_OR_RETURN(bool removed_degenerate_dimensions,
