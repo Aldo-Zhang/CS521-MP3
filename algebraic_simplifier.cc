@@ -2188,6 +2188,96 @@ absl::Status AlgebraicSimplifierVisitor::HandleSubtract(HloInstruction* sub) {
                                           negative_const));
   }
 
+  // Pattern: Square(A+B) - (A+B)*C => (A+B) * (A+B-C)
+  // This reduces FLOPs from 5*m*n to 3*m*n
+  VLOG(10) << "trying transform [Square(A+B) - (A+B)*C => (A+B)*(A+B-C)]: " 
+           << sub->ToString();
+  
+  HloInstruction *square_result, *mul_result;
+  HloInstruction *add_in_square_lhs, *add_in_square_rhs;
+  HloInstruction *add_in_mul, *c_operand;
+  
+  // Match: Subtract(Multiply(Add(A,B), Add(A,B)), Multiply(Add(A,B), C))
+  //        where the first Multiply is square (both operands are the same Add)
+  if (Match(sub, m::Subtract(
+                   m::Multiply(m::Add(m::Op(&add_in_square_lhs), m::Op(&add_in_square_rhs)),
+                               m::Add(m::Op(), m::Op())).WithOneUser(&square_result),
+                   m::Multiply(m::Add(m::Op(), m::Op()), 
+                               m::Op(&c_operand)).WithOneUser(&mul_result)))) {
+    
+    // Get the two operands of the square (both should be the same Add)
+    HloInstruction* square_lhs = square_result->mutable_operand(0);
+    HloInstruction* square_rhs = square_result->mutable_operand(1);
+    
+    // Check if it's actually a square: both operands are the same
+    if (square_lhs != square_rhs) {
+      VLOG(10) << "Not a square pattern, operands differ";
+      goto SKIP_DISTRIBUTIVE;
+    }
+    
+    // Get the Add(A,B) from the multiply on RHS
+    HloInstruction* mul_lhs = mul_result->mutable_operand(0);
+    HloInstruction* mul_rhs = mul_result->mutable_operand(1);
+    
+    // Determine which operand is Add(A,B) and which is C
+    HloInstruction* add_in_mul_actual = nullptr;
+    HloInstruction* c_actual = nullptr;
+    
+    if (mul_lhs->opcode() == HloOpcode::kAdd && mul_rhs->opcode() != HloOpcode::kAdd) {
+      add_in_mul_actual = mul_lhs;
+      c_actual = mul_rhs;
+    } else if (mul_rhs->opcode() == HloOpcode::kAdd && mul_lhs->opcode() != HloOpcode::kAdd) {
+      add_in_mul_actual = mul_rhs;
+      c_actual = mul_lhs;
+    } else {
+      VLOG(10) << "Could not identify Add and C in multiply";
+      goto SKIP_DISTRIBUTIVE;
+    }
+    
+    // Verify that the Add in square and the Add in multiply are the same
+    if (square_lhs != add_in_mul_actual) {
+      VLOG(10) << "Add operations are not the same";
+      goto SKIP_DISTRIBUTIVE;
+    }
+    
+    // Verify shapes match
+    if (!ShapeUtil::Compatible(square_lhs->shape(), c_actual->shape())) {
+      VLOG(10) << "Shape mismatch between Add and C";
+      goto SKIP_DISTRIBUTIVE;
+    }
+    
+    // Verify element types match
+    if (square_lhs->shape().element_type() != c_actual->shape().element_type()) {
+      VLOG(10) << "Element type mismatch";
+      goto SKIP_DISTRIBUTIVE;
+    }
+    
+    VLOG(10) << "DISTRIBUTIVE: Matched pattern Square(A+B) - (A+B)*C";
+    VLOG(10) << "DISTRIBUTIVE: Add(A,B) = " << square_lhs->name();
+    VLOG(10) << "DISTRIBUTIVE: C = " << c_actual->name();
+    
+    // Build the rewritten expression: (A+B) * ((A+B) - C)
+    // Note: We reuse square_lhs which is Add(A,B)
+    
+    // Create (A+B) - C
+    HloInstruction* sub_result = computation_->AddInstruction(
+        HloInstruction::CreateBinary(
+            square_lhs->shape(), HloOpcode::kSubtract, square_lhs, c_actual));
+    
+    // Create (A+B) * ((A+B) - C)
+    HloInstruction* final_mul = computation_->AddInstruction(
+        HloInstruction::CreateBinary(
+            sub->shape(), HloOpcode::kMultiply, square_lhs, sub_result));
+    
+    VLOG(10) << "DISTRIBUTIVE: Created optimized expression: " << final_mul->name();
+    
+    return ReplaceInstruction(sub, final_mul);
+  }
+  
+SKIP_DISTRIBUTIVE:
+  VLOG(10) << "DISTRIBUTIVE: Pattern not matched or preconditions not met";
+  // ========== End of DNNFusion Distributive Rule ==========
+  
   // A - A => 0 for integer A.
   VLOG(10) << "trying transform [A - A => 0] for integer A.";
   if (lhs == rhs && ShapeUtil::ElementIsIntegral(sub->shape())) {
@@ -4244,8 +4334,12 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice_for_other));
 
   VLOG(10) << "FUSION: other user_count after replacement=" << other->user_count();
+  
+  // NOTE: Do not remove 'other' here. The visitor may still visit it later
+  // (visitor traversal ordering issue), and removing it would cause undefined
+  // behavior. It's now dead code and will be cleaned up by the HloDCE pass,
+  // following XLA's design pattern of separating optimization from cleanup.
   // TF_RETURN_IF_ERROR(comp->RemoveInstruction(other));
-  VLOG(10) << "FUSION: marked other=" << other->name() << " with fusion marker";
 
   VLOG(10) << "FUSION: replacing dot=" << dot->name() << " with its slice";
   TF_RETURN_IF_ERROR(ReplaceInstruction(dot, slice_for_dot));

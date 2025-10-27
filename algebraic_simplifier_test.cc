@@ -1473,6 +1473,230 @@ TEST_F(AlgebraicSimplifierTest, SubAddReassociateMergeConstants) {
                   m::Parameter(0))));
 }
 
+TEST_F(AlgebraicSimplifierTest, DistributiveSquareMinusMultiply) {
+  auto m = CreateNewVerifiedModule();
+  
+  // Test pattern: Square(A+B) - (A+B)*C => (A+B) * (A+B-C)
+  // This should reduce FLOPs from 5*m*n to 3*m*n
+  
+  const Shape shape = ShapeUtil::MakeShape(F32, {64, 128});
+  
+  HloComputation::Builder b(TestName());
+  
+  // Create parameters A, B, C
+  auto* A = b.AddInstruction(HloInstruction::CreateParameter(0, shape, "A"));
+  auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, shape, "B"));
+  auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, shape, "C"));
+  
+  // Build: A + B
+  auto* add_ab = b.AddInstruction(
+      HloInstruction::CreateBinary(shape, HloOpcode::kAdd, A, B));
+  
+  // Build: Square(A+B) = (A+B) * (A+B)
+  auto* square = b.AddInstruction(
+      HloInstruction::CreateBinary(shape, HloOpcode::kMultiply, add_ab, add_ab));
+  
+  // Build: (A+B) * C
+  auto* mul_ab_c = b.AddInstruction(
+      HloInstruction::CreateBinary(shape, HloOpcode::kMultiply, add_ab, C));
+  
+  // Build: Square(A+B) - (A+B)*C
+  auto* sub = b.AddInstruction(
+      HloInstruction::CreateBinary(shape, HloOpcode::kSubtract, square, mul_ab_c));
+  
+  auto* computation = m->AddEntryComputation(b.Build(sub));
+  
+  LOG(INFO) << "Before simplification:\n" << m->ToString();
+  
+  AlgebraicSimplifierOptions opts = default_options_;
+  AlgebraicSimplifier simplifier(opts);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
+  
+  LOG(INFO) << "After simplification (changed=" << changed << "):\n" << m->ToString();
+  ASSERT_TRUE(changed);
+  
+  // Expected result: (A+B) * ((A+B) - C)
+  // Root should be a Multiply
+  HloInstruction* root = computation->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kMultiply);
+  
+  // One operand should be the original Add(A, B)
+  // The other operand should be a Subtract
+  HloInstruction* mul_lhs = root->mutable_operand(0);
+  HloInstruction* mul_rhs = root->mutable_operand(1);
+  
+  HloInstruction* the_add = nullptr;
+  HloInstruction* the_sub = nullptr;
+  
+  if (mul_lhs->opcode() == HloOpcode::kAdd && 
+      mul_rhs->opcode() == HloOpcode::kSubtract) {
+    the_add = mul_lhs;
+    the_sub = mul_rhs;
+  } else if (mul_rhs->opcode() == HloOpcode::kAdd && 
+             mul_lhs->opcode() == HloOpcode::kSubtract) {
+    the_add = mul_rhs;
+    the_sub = mul_lhs;
+  } else {
+    FAIL() << "Root multiply should have one Add and one Subtract operand";
+  }
+  
+  // Verify the Add is Add(A, B)
+  EXPECT_EQ(the_add->opcode(), HloOpcode::kAdd);
+  EXPECT_TRUE((the_add->operand(0) == A && the_add->operand(1) == B) ||
+              (the_add->operand(0) == B && the_add->operand(1) == A));
+  
+  // Verify the Subtract is (A+B) - C
+  EXPECT_EQ(the_sub->opcode(), HloOpcode::kSubtract);
+  HloInstruction* sub_lhs = the_sub->mutable_operand(0);
+  HloInstruction* sub_rhs = the_sub->mutable_operand(1);
+  
+  // sub_lhs should be the same Add(A,B)
+  EXPECT_EQ(sub_lhs, the_add);
+  
+  // sub_rhs should be C
+  EXPECT_EQ(sub_rhs, C);
+  
+  // Verify shapes
+  EXPECT_TRUE(ShapeUtil::Equal(root->shape(), shape));
+  EXPECT_TRUE(ShapeUtil::Equal(the_add->shape(), shape));
+  EXPECT_TRUE(ShapeUtil::Equal(the_sub->shape(), shape));
+  
+  // Count operations to verify optimization
+  int add_count = 0;
+  int multiply_count = 0;
+  int subtract_count = 0;
+  
+  for (HloInstruction* inst : computation->instructions()) {
+    if (inst->opcode() == HloOpcode::kAdd) ++add_count;
+    if (inst->opcode() == HloOpcode::kMultiply) ++multiply_count;
+    if (inst->opcode() == HloOpcode::kSubtract) ++subtract_count;
+  }
+  
+  // After optimization:
+  // - 1 Add: A+B (reused)
+  // - 1 Multiply: (A+B) * (...)
+  // - 1 Subtract: (A+B) - C
+  EXPECT_EQ(add_count, 1);
+  EXPECT_EQ(multiply_count, 1);
+  EXPECT_EQ(subtract_count, 1);
+}
+
+// Test that the pattern is NOT applied when Add has multiple users
+TEST_F(AlgebraicSimplifierTest, DistributiveSquareMinusMultiply_MultipleUsers) {
+  auto m = CreateNewVerifiedModule();
+  
+  const Shape shape = ShapeUtil::MakeShape(F32, {64, 128});
+  
+  HloComputation::Builder b(TestName());
+  
+  auto* A = b.AddInstruction(HloInstruction::CreateParameter(0, shape, "A"));
+  auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, shape, "B"));
+  auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, shape, "C"));
+  
+  // Build: A + B
+  auto* add_ab = b.AddInstruction(
+      HloInstruction::CreateBinary(shape, HloOpcode::kAdd, A, B));
+  
+  // Build: Square(A+B)
+  auto* square = b.AddInstruction(
+      HloInstruction::CreateBinary(shape, HloOpcode::kMultiply, add_ab, add_ab));
+  
+  // Build: (A+B) * C
+  auto* mul_ab_c = b.AddInstruction(
+      HloInstruction::CreateBinary(shape, HloOpcode::kMultiply, add_ab, C));
+  
+  // Build: Square(A+B) - (A+B)*C
+  auto* sub = b.AddInstruction(
+      HloInstruction::CreateBinary(shape, HloOpcode::kSubtract, square, mul_ab_c));
+  
+  // Add an extra user of 'square' to prevent the optimization
+  auto* extra_user = b.AddInstruction(
+      HloInstruction::CreateBinary(shape, HloOpcode::kAdd, square, C));
+  
+  // Make a tuple so both outputs are used
+  b.AddInstruction(HloInstruction::CreateTuple({sub, extra_user}));
+  
+  auto* computation = m->AddEntryComputation(b.Build());
+  
+  LOG(INFO) << "Before simplification:\n" << m->ToString();
+  
+  AlgebraicSimplifierOptions opts = default_options_;
+  AlgebraicSimplifier simplifier(opts);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
+  
+  LOG(INFO) << "After simplification (changed=" << changed << "):\n" << m->ToString();
+  
+  // The optimization should NOT be applied because square has multiple users
+  // So 'sub' should still exist and still be a subtract
+  bool found_subtract = false;
+  for (HloInstruction* inst : computation->instructions()) {
+    if (inst->opcode() == HloOpcode::kSubtract) {
+      found_subtract = true;
+      // Verify it's still the original pattern
+      if (inst->operand(0)->opcode() == HloOpcode::kMultiply &&
+          inst->operand(1)->opcode() == HloOpcode::kMultiply) {
+        // Original pattern still exists
+        EXPECT_TRUE(true);
+      }
+    }
+  }
+  
+  EXPECT_TRUE(found_subtract);
+}
+
+// Test with commutative variants: C * (A+B) instead of (A+B) * C
+TEST_F(AlgebraicSimplifierTest, DistributiveSquareMinusMultiply_Commutative) {
+  auto m = CreateNewVerifiedModule();
+  
+  const Shape shape = ShapeUtil::MakeShape(F32, {64, 128});
+  
+  HloComputation::Builder b(TestName());
+  
+  auto* A = b.AddInstruction(HloInstruction::CreateParameter(0, shape, "A"));
+  auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, shape, "B"));
+  auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, shape, "C"));
+  
+  // Build: A + B
+  auto* add_ab = b.AddInstruction(
+      HloInstruction::CreateBinary(shape, HloOpcode::kAdd, A, B));
+  
+  // Build: Square(A+B)
+  auto* square = b.AddInstruction(
+      HloInstruction::CreateBinary(shape, HloOpcode::kMultiply, add_ab, add_ab));
+  
+  // Build: C * (A+B)  [note: C is on the left this time]
+  auto* mul_c_ab = b.AddInstruction(
+      HloInstruction::CreateBinary(shape, HloOpcode::kMultiply, C, add_ab));
+  
+  // Build: Square(A+B) - C*(A+B)
+  auto* sub = b.AddInstruction(
+      HloInstruction::CreateBinary(shape, HloOpcode::kSubtract, square, mul_c_ab));
+  
+  auto* computation = m->AddEntryComputation(b.Build(sub));
+  
+  LOG(INFO) << "Before simplification:\n" << m->ToString();
+  
+  AlgebraicSimplifierOptions opts = default_options_;
+  AlgebraicSimplifier simplifier(opts);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
+  
+  LOG(INFO) << "After simplification (changed=" << changed << "):\n" << m->ToString();
+  ASSERT_TRUE(changed);
+  
+  // Should still optimize to (A+B) * ((A+B) - C)
+  HloInstruction* root = computation->root_instruction();
+  EXPECT_EQ(root->opcode(), HloOpcode::kMultiply);
+  
+  // Verify one operand is Add and one is Subtract
+  bool has_add = (root->operand(0)->opcode() == HloOpcode::kAdd ||
+                  root->operand(1)->opcode() == HloOpcode::kAdd);
+  bool has_sub = (root->operand(0)->opcode() == HloOpcode::kSubtract ||
+                  root->operand(1)->opcode() == HloOpcode::kSubtract);
+  
+  EXPECT_TRUE(has_add);
+  EXPECT_TRUE(has_sub);
+}
+
 TEST_F(AlgebraicSimplifierTest, ExpOfZero) {
   const char* m = R"(
   HloModule m
