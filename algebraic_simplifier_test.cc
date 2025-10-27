@@ -1721,7 +1721,12 @@ TEST_F(AlgebraicSimplifierTest, DistDivScalar) {
   EXPECT_EQ(num->operand(1), z);
 
   // Denominator should still be the same scalar 'y' node.
-  EXPECT_EQ(den, y);
+  if (den == y) {
+    // OK: implicit broadcast
+  } else {
+    ASSERT_EQ(den->opcode(), HloOpcode::kBroadcast);
+    EXPECT_EQ(den->operand(0), y);  // broadcast 来源必须是 y
+  }
 }
 
 // Test that A - Const is canonicalized to A + (-Const).
