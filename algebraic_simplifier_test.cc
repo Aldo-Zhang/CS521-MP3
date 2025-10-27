@@ -8700,21 +8700,16 @@ ENTRY AddDynamicUpdateSliceToAddSlice {
 TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply) {
   auto m = CreateNewVerifiedModule();
   
-  // Test pattern from DNNFusion Figure 2(a): Associative property
-  // (Conv(A,B))^-1 * ((Conv(A,B) * C)^-1) => (Conv(A,B))^-2 * C^-1
-  
-  const Shape input_shape = ShapeUtil::MakeShape(F32, {1, 3, 224, 224});   // NCHW
-  const Shape kernel_shape = ShapeUtil::MakeShape(F32, {64, 3, 3, 3});     // output_channels, input_channels, H, W
-  const Shape output_shape = ShapeUtil::MakeShape(F32, {1, 64, 224, 224}); // After convolution
+  const Shape input_shape = ShapeUtil::MakeShape(F32, {1, 3, 224, 224});
+  const Shape kernel_shape = ShapeUtil::MakeShape(F32, {64, 3, 3, 3});
+  const Shape output_shape = ShapeUtil::MakeShape(F32, {1, 64, 224, 224});
   
   HloComputation::Builder b(TestName());
   
-  // Create parameters A (input), B (kernel), C (multiplier)
   auto* A = b.AddInstruction(HloInstruction::CreateParameter(0, input_shape, "A"));
   auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, kernel_shape, "B"));
   auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, output_shape, "C"));
   
-  // Create convolution window and dimension numbers
   Window window;
   for (int i = 0; i < 2; ++i) {
     auto* dim = window.add_dimensions();
@@ -8731,23 +8726,18 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply) {
   dnums.set_input_feature_dimension(1);
   dnums.add_input_spatial_dimensions(2);
   dnums.add_input_spatial_dimensions(3);
-  
   dnums.set_kernel_output_feature_dimension(0);
   dnums.set_kernel_input_feature_dimension(1);
   dnums.add_kernel_spatial_dimensions(2);
   dnums.add_kernel_spatial_dimensions(3);
-  
   dnums.set_output_batch_dimension(0);
   dnums.set_output_feature_dimension(1);
   dnums.add_output_spatial_dimensions(2);
   dnums.add_output_spatial_dimensions(3);
   
-  // Build: Conv(A, B)
   auto* conv = b.AddInstruction(HloInstruction::CreateConvolve(
-      output_shape, A, B, /*feature_group_count=*/1, /*batch_group_count=*/1,
-      window, dnums, DefaultPrecisionConfig(2)));
+      output_shape, A, B, 1, 1, window, dnums, DefaultPrecisionConfig(2)));
   
-  // Build: Reciprocal(Conv) using Divide(1, Conv)
   auto* one_for_conv = b.AddInstruction(
       HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0f)));
   auto* one_broadcast_conv = b.AddInstruction(
@@ -8756,11 +8746,9 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply) {
       HloInstruction::CreateBinary(output_shape, HloOpcode::kDivide, 
                                    one_broadcast_conv, conv));
   
-  // Build: Conv * C
   auto* mul_conv_c = b.AddInstruction(
       HloInstruction::CreateBinary(output_shape, HloOpcode::kMultiply, conv, C));
   
-  // Build: Reciprocal(Conv * C)
   auto* one_for_mul = b.AddInstruction(
       HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0f)));
   auto* one_broadcast_mul = b.AddInstruction(
@@ -8769,7 +8757,6 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply) {
       HloInstruction::CreateBinary(output_shape, HloOpcode::kDivide, 
                                    one_broadcast_mul, mul_conv_c));
   
-  // Build: Recip(Conv) * Recip(Conv * C)
   auto* final_mul = b.AddInstruction(
       HloInstruction::CreateBinary(output_shape, HloOpcode::kMultiply, 
                                    recip_conv, recip_mul));
@@ -8785,13 +8772,9 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply) {
   LOG(INFO) << "After simplification (changed=" << changed << "):\n" << m->ToString();
   ASSERT_TRUE(changed);
   
-  // Expected result: Recip(Square(Conv)) * Recip(C)
-  // Root should be a Multiply
   HloInstruction* root = computation->root_instruction();
   ASSERT_EQ(root->opcode(), HloOpcode::kMultiply);
   
-  // One operand should be Reciprocal of something
-  // The other operand should be Reciprocal of C
   HloInstruction* mul_op0 = root->mutable_operand(0);
   HloInstruction* mul_op1 = root->mutable_operand(1);
   
@@ -8799,21 +8782,18 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply) {
   auto is_reciprocal_of = [](HloInstruction* inst, HloInstruction* expected) {
     if (inst->opcode() != HloOpcode::kDivide) return false;
     
-    // Check if numerator is constant 1
     HloInstruction* numerator = inst->mutable_operand(0);
     if (numerator->opcode() == HloOpcode::kBroadcast) {
       numerator = numerator->mutable_operand(0);
     }
     if (numerator->opcode() != HloOpcode::kConstant) return false;
     
-    auto literal = numerator->literal();
+    const Literal& literal = numerator->literal();  // 使用 const 引用
     if (!literal.IsAll(1.0f)) return false;
     
-    // Check if denominator matches expected
     return inst->operand(1) == expected;
   };
   
-  // Find which is Recip(Square(Conv)) and which is Recip(C)
   HloInstruction* recip_square = nullptr;
   HloInstruction* recip_c = nullptr;
   
@@ -8830,24 +8810,20 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply) {
   ASSERT_NE(recip_square, nullptr);
   ASSERT_NE(recip_c, nullptr);
   
-  // Verify recip_c is Divide(1, C)
   EXPECT_EQ(recip_c->opcode(), HloOpcode::kDivide);
   EXPECT_EQ(recip_c->operand(1), C);
   
-  // Verify recip_square is Divide(1, Square(Conv))
   EXPECT_EQ(recip_square->opcode(), HloOpcode::kDivide);
   
   HloInstruction* square = recip_square->mutable_operand(1);
   EXPECT_EQ(square->opcode(), HloOpcode::kMultiply);
-  EXPECT_EQ(square->operand(0), square->operand(1)); // Square: x * x
+  EXPECT_EQ(square->operand(0), square->operand(1));
   
-  // The operand of square should be the convolution
   HloInstruction* conv_in_square = square->mutable_operand(0);
   EXPECT_EQ(conv_in_square->opcode(), HloOpcode::kConvolution);
   EXPECT_EQ(conv_in_square->operand(0), A);
   EXPECT_EQ(conv_in_square->operand(1), B);
   
-  // Count convolutions - should be only 1 now
   int conv_count = 0;
   for (HloInstruction* inst : computation->instructions()) {
     if (inst->opcode() == HloOpcode::kConvolution) ++conv_count;
@@ -9040,11 +9016,12 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply_MultipleUsers)
       if (numerator->opcode() == HloOpcode::kBroadcast) {
         numerator = numerator->mutable_operand(0);
       }
-      if (numerator->opcode() == HloOpcode::kConstant &&
-          numerator->literal().IsAll(1.0f)) {
-        found_recip_with_multiple_users = true;
-        break;
-      }
+      if (numerator->opcode() == HloOpcode::kConstant) {
+        const Literal& literal = numerator->literal();  // 使用 const 引用
+        if (literal.IsAll(1.0f)) {
+          found_recip_with_multiple_users = true;
+          break;
+        }
     }
   }
   
