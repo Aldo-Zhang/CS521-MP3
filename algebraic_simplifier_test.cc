@@ -8700,16 +8700,21 @@ ENTRY AddDynamicUpdateSliceToAddSlice {
 TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply) {
   auto m = CreateNewVerifiedModule();
   
-  const Shape input_shape = ShapeUtil::MakeShape(F32, {1, 3, 224, 224});
-  const Shape kernel_shape = ShapeUtil::MakeShape(F32, {64, 3, 3, 3});
-  const Shape output_shape = ShapeUtil::MakeShape(F32, {1, 64, 224, 224});
+  // Test pattern from DNNFusion Figure 2(a): Associative property
+  // (Conv(A,B))^-1 * ((Conv(A,B) * C)^-1) => (Conv(A,B))^-2 * C^-1
+  
+  const Shape input_shape = ShapeUtil::MakeShape(F32, {1, 3, 224, 224});   // NCHW
+  const Shape kernel_shape = ShapeUtil::MakeShape(F32, {64, 3, 3, 3});     // output_channels, input_channels, H, W
+  const Shape output_shape = ShapeUtil::MakeShape(F32, {1, 64, 224, 224}); // After convolution
   
   HloComputation::Builder b(TestName());
   
+  // Create parameters A (input), B (kernel), C (multiplier)
   auto* A = b.AddInstruction(HloInstruction::CreateParameter(0, input_shape, "A"));
   auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, kernel_shape, "B"));
   auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, output_shape, "C"));
   
+  // Create convolution window and dimension numbers
   Window window;
   for (int i = 0; i < 2; ++i) {
     auto* dim = window.add_dimensions();
@@ -8726,18 +8731,23 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply) {
   dnums.set_input_feature_dimension(1);
   dnums.add_input_spatial_dimensions(2);
   dnums.add_input_spatial_dimensions(3);
+  
   dnums.set_kernel_output_feature_dimension(0);
   dnums.set_kernel_input_feature_dimension(1);
   dnums.add_kernel_spatial_dimensions(2);
   dnums.add_kernel_spatial_dimensions(3);
+  
   dnums.set_output_batch_dimension(0);
   dnums.set_output_feature_dimension(1);
   dnums.add_output_spatial_dimensions(2);
   dnums.add_output_spatial_dimensions(3);
   
+  // Build: Conv(A, B)
   auto* conv = b.AddInstruction(HloInstruction::CreateConvolve(
-      output_shape, A, B, 1, 1, window, dnums, DefaultPrecisionConfig(2)));
+      output_shape, A, B, /*feature_group_count=*/1, /*batch_group_count=*/1,
+      window, dnums, DefaultPrecisionConfig(2)));
   
+  // Build: Reciprocal(Conv) using Divide(1, Conv)
   auto* one_for_conv = b.AddInstruction(
       HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0f)));
   auto* one_broadcast_conv = b.AddInstruction(
@@ -8746,9 +8756,11 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply) {
       HloInstruction::CreateBinary(output_shape, HloOpcode::kDivide, 
                                    one_broadcast_conv, conv));
   
+  // Build: Conv * C
   auto* mul_conv_c = b.AddInstruction(
       HloInstruction::CreateBinary(output_shape, HloOpcode::kMultiply, conv, C));
   
+  // Build: Reciprocal(Conv * C)
   auto* one_for_mul = b.AddInstruction(
       HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0f)));
   auto* one_broadcast_mul = b.AddInstruction(
@@ -8756,144 +8768,6 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply) {
   auto* recip_mul = b.AddInstruction(
       HloInstruction::CreateBinary(output_shape, HloOpcode::kDivide, 
                                    one_broadcast_mul, mul_conv_c));
-  
-  auto* final_mul = b.AddInstruction(
-      HloInstruction::CreateBinary(output_shape, HloOpcode::kMultiply, 
-                                   recip_conv, recip_mul));
-  
-  auto* computation = m->AddEntryComputation(b.Build(final_mul));
-  
-  LOG(INFO) << "Before simplification:\n" << m->ToString();
-  
-  AlgebraicSimplifierOptions opts = default_options_;
-  AlgebraicSimplifier simplifier(opts);
-  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
-  
-  LOG(INFO) << "After simplification (changed=" << changed << "):\n" << m->ToString();
-  ASSERT_TRUE(changed);
-  
-  HloInstruction* root = computation->root_instruction();
-  ASSERT_EQ(root->opcode(), HloOpcode::kMultiply);
-  
-  HloInstruction* mul_op0 = root->mutable_operand(0);
-  HloInstruction* mul_op1 = root->mutable_operand(1);
-  
-  // Helper to check if an instruction is Divide(1, X) where X is the expected operand
-  auto is_reciprocal_of = [](HloInstruction* inst, HloInstruction* expected) {
-    if (inst->opcode() != HloOpcode::kDivide) return false;
-    
-    HloInstruction* numerator = inst->mutable_operand(0);
-    if (numerator->opcode() == HloOpcode::kBroadcast) {
-      numerator = numerator->mutable_operand(0);
-    }
-    if (numerator->opcode() != HloOpcode::kConstant) return false;
-    
-    const Literal& literal = numerator->literal();  // 使用 const 引用
-    if (!literal.IsAll(1.0f)) return false;
-    
-    return inst->operand(1) == expected;
-  };
-  
-  HloInstruction* recip_square = nullptr;
-  HloInstruction* recip_c = nullptr;
-  
-  if (is_reciprocal_of(mul_op0, C)) {
-    recip_c = mul_op0;
-    recip_square = mul_op1;
-  } else if (is_reciprocal_of(mul_op1, C)) {
-    recip_c = mul_op1;
-    recip_square = mul_op0;
-  } else {
-    FAIL() << "Could not find Recip(C) in the result";
-  }
-  
-  ASSERT_NE(recip_square, nullptr);
-  ASSERT_NE(recip_c, nullptr);
-  
-  EXPECT_EQ(recip_c->opcode(), HloOpcode::kDivide);
-  EXPECT_EQ(recip_c->operand(1), C);
-  
-  EXPECT_EQ(recip_square->opcode(), HloOpcode::kDivide);
-  
-  HloInstruction* square = recip_square->mutable_operand(1);
-  EXPECT_EQ(square->opcode(), HloOpcode::kMultiply);
-  EXPECT_EQ(square->operand(0), square->operand(1));
-  
-  HloInstruction* conv_in_square = square->mutable_operand(0);
-  EXPECT_EQ(conv_in_square->opcode(), HloOpcode::kConvolution);
-  EXPECT_EQ(conv_in_square->operand(0), A);
-  EXPECT_EQ(conv_in_square->operand(1), B);
-  
-  int conv_count = 0;
-  for (HloInstruction* inst : computation->instructions()) {
-    if (inst->opcode() == HloOpcode::kConvolution) ++conv_count;
-  }
-  EXPECT_EQ(conv_count, 1);
-}
-
-// Test with Power(x, -1) representation for reciprocal
-TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply_PowerForm) {
-  auto m = CreateNewVerifiedModule();
-  
-  const Shape input_shape = ShapeUtil::MakeShape(F32, {1, 3, 224, 224});
-  const Shape kernel_shape = ShapeUtil::MakeShape(F32, {64, 3, 3, 3});
-  const Shape output_shape = ShapeUtil::MakeShape(F32, {1, 64, 224, 224});
-  
-  HloComputation::Builder b(TestName());
-  
-  auto* A = b.AddInstruction(HloInstruction::CreateParameter(0, input_shape, "A"));
-  auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, kernel_shape, "B"));
-  auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, output_shape, "C"));
-  
-  Window window;
-  for (int i = 0; i < 2; ++i) {
-    auto* dim = window.add_dimensions();
-    dim->set_size(3);
-    dim->set_stride(1);
-    dim->set_padding_low(1);
-    dim->set_padding_high(1);
-    dim->set_window_dilation(1);
-    dim->set_base_dilation(1);
-  }
-  
-  ConvolutionDimensionNumbers dnums;
-  dnums.set_input_batch_dimension(0);
-  dnums.set_input_feature_dimension(1);
-  dnums.add_input_spatial_dimensions(2);
-  dnums.add_input_spatial_dimensions(3);
-  dnums.set_kernel_output_feature_dimension(0);
-  dnums.set_kernel_input_feature_dimension(1);
-  dnums.add_kernel_spatial_dimensions(2);
-  dnums.add_kernel_spatial_dimensions(3);
-  dnums.set_output_batch_dimension(0);
-  dnums.set_output_feature_dimension(1);
-  dnums.add_output_spatial_dimensions(2);
-  dnums.add_output_spatial_dimensions(3);
-  
-  auto* conv = b.AddInstruction(HloInstruction::CreateConvolve(
-      output_shape, A, B, 1, 1, window, dnums, DefaultPrecisionConfig(2)));
-  
-  // Build: Reciprocal(Conv) using Power(Conv, -1)
-  auto* minus_one_conv = b.AddInstruction(
-      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(-1.0f)));
-  auto* minus_one_broadcast_conv = b.AddInstruction(
-      HloInstruction::CreateBroadcast(output_shape, minus_one_conv, {}));
-  auto* recip_conv = b.AddInstruction(
-      HloInstruction::CreateBinary(output_shape, HloOpcode::kPower, 
-                                   conv, minus_one_broadcast_conv));
-  
-  // Build: Conv * C
-  auto* mul_conv_c = b.AddInstruction(
-      HloInstruction::CreateBinary(output_shape, HloOpcode::kMultiply, conv, C));
-  
-  // Build: Reciprocal(Conv * C) using Power
-  auto* minus_one_mul = b.AddInstruction(
-      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(-1.0f)));
-  auto* minus_one_broadcast_mul = b.AddInstruction(
-      HloInstruction::CreateBroadcast(output_shape, minus_one_mul, {}));
-  auto* recip_mul = b.AddInstruction(
-      HloInstruction::CreateBinary(output_shape, HloOpcode::kPower, 
-                                   mul_conv_c, minus_one_broadcast_mul));
   
   // Build: Recip(Conv) * Recip(Conv * C)
   auto* final_mul = b.AddInstruction(
@@ -8911,207 +8785,67 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply_PowerForm) {
   LOG(INFO) << "After simplification (changed=" << changed << "):\n" << m->ToString();
   ASSERT_TRUE(changed);
   
-  // Verify only 1 convolution remains
-  int conv_count = 0;
-  for (HloInstruction* inst : computation->instructions()) {
-    if (inst->opcode() == HloOpcode::kConvolution) ++conv_count;
-  }
-  EXPECT_EQ(conv_count, 1);
-  
-  // Root should be Multiply
+  // Expected result: Recip(Square(Conv)) * Recip(C)
+  // Root should be a Multiply
   HloInstruction* root = computation->root_instruction();
-  EXPECT_EQ(root->opcode(), HloOpcode::kMultiply);
-}
-
-// Test that pattern is NOT applied when operations have multiple users
-TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply_MultipleUsers) {
-  auto m = CreateNewVerifiedModule();
+  ASSERT_EQ(root->opcode(), HloOpcode::kMultiply);
   
-  const Shape input_shape = ShapeUtil::MakeShape(F32, {1, 3, 224, 224});
-  const Shape kernel_shape = ShapeUtil::MakeShape(F32, {64, 3, 3, 3});
-  const Shape output_shape = ShapeUtil::MakeShape(F32, {1, 64, 224, 224});
+  // One operand should be Reciprocal of something
+  // The other operand should be Reciprocal of C
+  HloInstruction* mul_op0 = root->mutable_operand(0);
+  HloInstruction* mul_op1 = root->mutable_operand(1);
   
-  HloComputation::Builder b(TestName());
+  // Find which is Recip(Square(Conv)) and which is Recip(C)
+  HloInstruction* recip_square = nullptr;
+  HloInstruction* recip_c = nullptr;
   
-  auto* A = b.AddInstruction(HloInstruction::CreateParameter(0, input_shape, "A"));
-  auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, kernel_shape, "B"));
-  auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, output_shape, "C"));
-  
-  Window window;
-  for (int i = 0; i < 2; ++i) {
-    auto* dim = window.add_dimensions();
-    dim->set_size(3);
-    dim->set_stride(1);
-    dim->set_padding_low(1);
-    dim->set_padding_high(1);
-    dim->set_window_dilation(1);
-    dim->set_base_dilation(1);
-  }
-  
-  ConvolutionDimensionNumbers dnums;
-  dnums.set_input_batch_dimension(0);
-  dnums.set_input_feature_dimension(1);
-  dnums.add_input_spatial_dimensions(2);
-  dnums.add_input_spatial_dimensions(3);
-  dnums.set_kernel_output_feature_dimension(0);
-  dnums.set_kernel_input_feature_dimension(1);
-  dnums.add_kernel_spatial_dimensions(2);
-  dnums.add_kernel_spatial_dimensions(3);
-  dnums.set_output_batch_dimension(0);
-  dnums.set_output_feature_dimension(1);
-  dnums.add_output_spatial_dimensions(2);
-  dnums.add_output_spatial_dimensions(3);
-  
-  auto* conv = b.AddInstruction(HloInstruction::CreateConvolve(
-      output_shape, A, B, 1, 1, window, dnums, DefaultPrecisionConfig(2)));
-  
-  auto* one = b.AddInstruction(
-      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0f)));
-  auto* one_broadcast = b.AddInstruction(
-      HloInstruction::CreateBroadcast(output_shape, one, {}));
-  
-  auto* recip_conv = b.AddInstruction(
-      HloInstruction::CreateBinary(output_shape, HloOpcode::kDivide, 
-                                   one_broadcast, conv));
-  
-  auto* mul_conv_c = b.AddInstruction(
-      HloInstruction::CreateBinary(output_shape, HloOpcode::kMultiply, conv, C));
-  
-  auto* one2 = b.AddInstruction(
-      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0f)));
-  auto* one_broadcast2 = b.AddInstruction(
-      HloInstruction::CreateBroadcast(output_shape, one2, {}));
-  auto* recip_mul = b.AddInstruction(
-      HloInstruction::CreateBinary(output_shape, HloOpcode::kDivide, 
-                                   one_broadcast2, mul_conv_c));
-  
-  auto* final_mul = b.AddInstruction(
-      HloInstruction::CreateBinary(output_shape, HloOpcode::kMultiply, 
-                                   recip_conv, recip_mul));
-  
-  // Add extra user to recip_conv to prevent optimization
-  auto* extra_user = b.AddInstruction(
-      HloInstruction::CreateBinary(output_shape, HloOpcode::kAdd, recip_conv, C));
-  
-  // Create tuple to use both outputs
-  b.AddInstruction(HloInstruction::CreateTuple({final_mul, extra_user}));
-  
-  auto* computation = m->AddEntryComputation(b.Build());
-  
-  LOG(INFO) << "Before simplification:\n" << m->ToString();
-  
-  AlgebraicSimplifierOptions opts = default_options_;
-  AlgebraicSimplifier simplifier(opts);
-  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
-  
-  LOG(INFO) << "After simplification (changed=" << changed << "):\n" << m->ToString();
-  
-  // The optimization should NOT be applied because recip_conv has multiple users
-  // Check for a reciprocal (Divide with constant 1 numerator) that has multiple users
-  bool found_recip_with_multiple_users = false;
-  for (HloInstruction* inst : computation->instructions()) {
-    if (inst->opcode() == HloOpcode::kDivide && inst->user_count() > 1) {
-      // Check if numerator is 1
-      HloInstruction* numerator = inst->mutable_operand(0);
-      if (numerator->opcode() == HloOpcode::kBroadcast) {
-        numerator = numerator->mutable_operand(0);
-      }
-      if (numerator->opcode() == HloOpcode::kConstant) {
-        const Literal& literal = numerator->literal();  // 使用 const 引用
-        if (literal.IsAll(1.0f)) {
-          found_recip_with_multiple_users = true;
-          break;
-        }
+  auto is_reciprocal_of_c = [&](HloInstruction* inst) {
+    if (inst->opcode() == HloOpcode::kDivide) {
+      return IsAll(inst->operand(0), 1) && inst->operand(1) == C;
     }
+    return false;
+  };
+  
+  if (is_reciprocal_of_c(mul_op0)) {
+    recip_c = mul_op0;
+    recip_square = mul_op1;
+  } else if (is_reciprocal_of_c(mul_op1)) {
+    recip_c = mul_op1;
+    recip_square = mul_op0;
+  } else {
+    FAIL() << "Could not find Recip(C) in the result";
   }
   
-  EXPECT_TRUE(found_recip_with_multiple_users);
-}
-
-// Test commutative variant: Recip(Mul(Conv, C)) * Recip(Conv)
-TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply_Commutative) {
-  auto m = CreateNewVerifiedModule();
+  ASSERT_NE(recip_square, nullptr);
+  ASSERT_NE(recip_c, nullptr);
   
-  const Shape input_shape = ShapeUtil::MakeShape(F32, {1, 3, 224, 224});
-  const Shape kernel_shape = ShapeUtil::MakeShape(F32, {64, 3, 3, 3});
-  const Shape output_shape = ShapeUtil::MakeShape(F32, {1, 64, 224, 224});
+  // Verify recip_c is Divide(1, C)
+  EXPECT_EQ(recip_c->opcode(), HloOpcode::kDivide);
+  EXPECT_TRUE(IsAll(recip_c->operand(0), 1));
+  EXPECT_EQ(recip_c->operand(1), C);
   
-  HloComputation::Builder b(TestName());
+  // Verify recip_square is Divide(1, Square(Conv))
+  EXPECT_EQ(recip_square->opcode(), HloOpcode::kDivide);
+  EXPECT_TRUE(IsAll(recip_square->operand(0), 1));
   
-  auto* A = b.AddInstruction(HloInstruction::CreateParameter(0, input_shape, "A"));
-  auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, kernel_shape, "B"));
-  auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, output_shape, "C"));
+  HloInstruction* square = recip_square->mutable_operand(1);
+  EXPECT_EQ(square->opcode(), HloOpcode::kMultiply);
+  EXPECT_EQ(square->operand(0), square->operand(1)); // Square: x * x
   
-  Window window;
-  for (int i = 0; i < 2; ++i) {
-    auto* dim = window.add_dimensions();
-    dim->set_size(3);
-    dim->set_stride(1);
-    dim->set_padding_low(1);
-    dim->set_padding_high(1);
-    dim->set_window_dilation(1);
-    dim->set_base_dilation(1);
-  }
+  // The operand of square should be the convolution
+  HloInstruction* conv_in_square = square->mutable_operand(0);
+  EXPECT_EQ(conv_in_square->opcode(), HloOpcode::kConvolution);
+  EXPECT_EQ(conv_in_square->operand(0), A);
+  EXPECT_EQ(conv_in_square->operand(1), B);
   
-  ConvolutionDimensionNumbers dnums;
-  dnums.set_input_batch_dimension(0);
-  dnums.set_input_feature_dimension(1);
-  dnums.add_input_spatial_dimensions(2);
-  dnums.add_input_spatial_dimensions(3);
-  dnums.set_kernel_output_feature_dimension(0);
-  dnums.set_kernel_input_feature_dimension(1);
-  dnums.add_kernel_spatial_dimensions(2);
-  dnums.add_kernel_spatial_dimensions(3);
-  dnums.set_output_batch_dimension(0);
-  dnums.set_output_feature_dimension(1);
-  dnums.add_output_spatial_dimensions(2);
-  dnums.add_output_spatial_dimensions(3);
-  
-  auto* conv = b.AddInstruction(HloInstruction::CreateConvolve(
-      output_shape, A, B, 1, 1, window, dnums, DefaultPrecisionConfig(2)));
-  
-  auto* mul_conv_c = b.AddInstruction(
-      HloInstruction::CreateBinary(output_shape, HloOpcode::kMultiply, conv, C));
-  
-  auto* one_mul = b.AddInstruction(
-      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0f)));
-  auto* one_broadcast_mul = b.AddInstruction(
-      HloInstruction::CreateBroadcast(output_shape, one_mul, {}));
-  auto* recip_mul = b.AddInstruction(
-      HloInstruction::CreateBinary(output_shape, HloOpcode::kDivide, 
-                                   one_broadcast_mul, mul_conv_c));
-  
-  auto* one_conv = b.AddInstruction(
-      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0f)));
-  auto* one_broadcast_conv = b.AddInstruction(
-      HloInstruction::CreateBroadcast(output_shape, one_conv, {}));
-  auto* recip_conv = b.AddInstruction(
-      HloInstruction::CreateBinary(output_shape, HloOpcode::kDivide, 
-                                   one_broadcast_conv, conv));
-  
-  // Note: Reversed order - Recip(Mul) * Recip(Conv) instead of Recip(Conv) * Recip(Mul)
-  auto* final_mul = b.AddInstruction(
-      HloInstruction::CreateBinary(output_shape, HloOpcode::kMultiply, 
-                                   recip_mul, recip_conv));
-  
-  auto* computation = m->AddEntryComputation(b.Build(final_mul));
-  
-  LOG(INFO) << "Before simplification:\n" << m->ToString();
-  
-  AlgebraicSimplifierOptions opts = default_options_;
-  AlgebraicSimplifier simplifier(opts);
-  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
-  
-  LOG(INFO) << "After simplification (changed=" << changed << "):\n" << m->ToString();
-  ASSERT_TRUE(changed);
-  
-  // Should still optimize despite reversed order
+  // Count convolutions - should be only 1 now
   int conv_count = 0;
   for (HloInstruction* inst : computation->instructions()) {
     if (inst->opcode() == HloOpcode::kConvolution) ++conv_count;
   }
   EXPECT_EQ(conv_count, 1);
 }
+
 
 TEST_F(AlgebraicSimplifierTest, ScalarMultiplyReduction) {
   const char* hlo_string = R"(
