@@ -896,17 +896,28 @@ absl::Status AlgebraicSimplifierVisitor::HandleAdd(HloInstruction* add) {
 
   if (ys0 != ys1 || !ShapeUtil::IsScalar(ys0->shape())) return absl::OkStatus();
 
-  // Assert that x and z has the same shape and rank 
+  // Assert that x and z has the same shape
   if (!ShapeUtil::Compatible(x->shape(), z->shape())) return absl::OkStatus();
-
-  HloInstruction* denom = den0;
 
   auto* comp = add->parent();
   auto* x_plus_z = comp->AddInstruction(
       HloInstruction::CreateBinary(x->shape(), HloOpcode::kAdd, x, z));
+
+  HloInstruction* broadcast_denom;
+  if (den0->opcode() == HloOpcode::kBroadcast && 
+      ShapeUtil::Compatible(den0->shape(), x->shape())) {
+    broadcast_denom = den0;
+  } else if (den1->opcode() == HloOpcode::kBroadcast && 
+            ShapeUtil::Compatible(den1->shape(), x->shape())) {
+    broadcast_denom = den1;
+  } else {
+    broadcast_denom = comp->AddInstruction(
+        HloInstruction::CreateBroadcast(x->shape(), ys0, {}));
+  }
+
   return ReplaceWithNewInstruction(
       add, HloInstruction::CreateBinary(add->shape(), HloOpcode::kDivide,
-                                        x_plus_z, denom));
+                                        x_plus_z, broadcast_denom));
 
   // Canonicalization: Put constants on the right.  This makes the reassociation
   // rules below simpler.
@@ -4270,8 +4281,6 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     goto FUSE_SKIP;
   }
 
-    // ⭐⭐⭐ 关键改变：只在 dot 的 ID 更大时融合
-  // 这样 other（ID 较小）已经被 visitor 访问过，可以安全删除
   if (dot->unique_id() < other->unique_id()) {
     VLOG(10) << "FUSION SKIP: dot id=" << dot->unique_id() 
             << " < other id=" << other->unique_id() 
@@ -4299,13 +4308,12 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
 
   const int64_t M  = a.dimensions(0);
   const int64_t K  = a.dimensions(1);
-  const int64_t N_other = c.dimensions(1);  // other 的宽度（ID 小，排前面）
-  const int64_t N_dot = b.dimensions(1);    // dot 的宽度（ID 大，排后面）
+  const int64_t N_other = c.dimensions(1);  // other 
+  const int64_t N_dot = b.dimensions(1);    // dot 
 
   VLOG(10) << "FUSION: M=" << M << " K=" << K 
           << " N_other=" << N_other << " N_dot=" << N_dot;
 
-  // ⭐ concat 顺序：other 的 RHS (C) 在前，dot 的 RHS (B) 在后
   Shape rhs_shape = ShapeUtil::MakeShape(b.element_type(), {K, N_other + N_dot});
   HloInstruction* rhs_concat = comp->AddInstruction(
       HloInstruction::CreateConcatenate(rhs_shape, {C, B}, /*dimension=*/1));
@@ -4328,13 +4336,11 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
         s, fused_dot, /*start_indices=*/{0, cs}, /*limit_indices=*/{M, cl}, /*strides=*/{1, 1}));
   };
 
-  // ⭐ slice 分配：other（ID 小）在前，dot（ID 大）在后
   HloInstruction* slice_for_other = make_slice(0, N_other);
   HloInstruction* slice_for_dot = make_slice(N_other, N_other + N_dot);
   VLOG(10) << "FUSION: slice_for_other=[0:" << N_other 
           << "], slice_for_dot=[" << N_other << ":" << (N_other + N_dot) << "]";
 
-  // Rewire other（已经被访问过，可以安全删除）
   VLOG(10) << "FUSION: replacing other=" << other->name();
   TF_RETURN_IF_ERROR(other->ReplaceAllUsesWith(slice_for_other));
 
