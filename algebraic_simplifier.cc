@@ -4236,7 +4236,7 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
       break;
     }
     if (other == nullptr) goto FUSE_SKIP;
-    if (other->unique_id() < dot->unique_id()) goto FUSE_SKIP; // anti double-fire
+    if (other->unique_id() > dot->unique_id()) goto FUSE_SKIP; // anti double-fire
     if (other->user_count() == 0) goto FUSE_SKIP;
 
     HloInstruction* C = other->mutable_operand(1);
