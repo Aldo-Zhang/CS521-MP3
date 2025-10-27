@@ -4270,7 +4270,7 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     goto FUSE_SKIP;
   }
 
-  // ⭐⭐⭐ 关键改变：只在 dot 的 ID 更大时融合
+    // ⭐⭐⭐ 关键改变：只在 dot 的 ID 更大时融合
   // 这样 other（ID 较小）已经被 visitor 访问过，可以安全删除
   if (dot->unique_id() < other->unique_id()) {
     VLOG(10) << "FUSION SKIP: dot id=" << dot->unique_id() 
@@ -4348,6 +4348,29 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   TF_RETURN_IF_ERROR(ReplaceInstruction(dot, slice_for_dot));
 
   VLOG(10) << "FUSION SUCCESS!";
+  return absl::OkStatus();
+  }
+FUSE_SKIP:
+  VLOG(10) << "FUSION SKIP label reached";
+  // ---- end fusion block ----
+  
+  TF_ASSIGN_OR_RETURN(bool removed_degenerate_dimensions,
+                      RemoveDegenerateDimensionFromDot(dot_cast));
+  if (removed_degenerate_dimensions) {
+    return absl::OkStatus();
+  }
+
+  TF_ASSIGN_OR_RETURN(bool removed_transposes,
+                      RemoveTransposesFromDotOperands(dot_cast));
+  if (removed_transposes) {
+    return absl::OkStatus();
+  }
+
+  TF_ASSIGN_OR_RETURN(bool moved_param_to_rhs, MoveDotParamToRhs(dot_cast));
+  if (moved_param_to_rhs) {
+    return absl::OkStatus();
+  }
+
   return absl::OkStatus();
 }
 
