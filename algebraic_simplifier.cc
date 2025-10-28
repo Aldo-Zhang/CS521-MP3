@@ -7143,11 +7143,11 @@ SKIP_RESHAPE_DECOMPOSITION:
   VLOG(10) << "RESHAPE_DECOMP: Pattern not matched or not layout sensitive";
   // ========== End of Reshape Decomposition Rule ==========
 
-  // Make this a bitcast if possible.
-  if (HloInstruction* bitcast_operand =
-          BitcastingOperandOfReshapeOrCopyChain(reshape, options_)) {
-    ReplaceWithBitcast(reshape, bitcast_operand);
-  }
+  // // Make this a bitcast if possible.
+  // if (HloInstruction* bitcast_operand =
+  //         BitcastingOperandOfReshapeOrCopyChain(reshape, options_)) {
+  //   ReplaceWithBitcast(reshape, bitcast_operand);
+  // }
 
   return absl::OkStatus();
 }
