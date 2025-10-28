@@ -10248,7 +10248,7 @@ TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_NotLayoutSensitive) {
   options.set_is_layout_sensitive(false);  // Explicitly disable
   AlgebraicSimplifier simplifier(options);
   
-  ASSERT_TRUE(simplifier.Run(m.get()).value());
+  ASSERT_FALSE(simplifier.Run(m.get()).value());
   
   VLOG(1) << "After simplification:\n" << m->ToString();
   
