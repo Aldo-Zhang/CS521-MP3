@@ -5281,6 +5281,148 @@ SKIP_ASSOCIATIVE:
   VLOG(10) << "ASSOCIATIVE: Pattern not matched or preconditions not met";
   // ========== End of DNNFusion Associative Rule ==========
 
+  // Pattern: (A * ReduceSum(B)) * (ReduceSum(B) * C) => A * Square(ReduceSum(B)) * C
+  // This reduces ReduceSum operations from 2 to 1
+  VLOG(10) << "trying transform [(A * ReduceSum) * (ReduceSum * C) => A * Square(ReduceSum) * C]: " 
+           << multiply->ToString();
+  
+  {
+    HloInstruction *mul_lhs, *mul_rhs;
+    HloInstruction *reduce_in_lhs, *reduce_in_rhs;
+    
+    // Match: Multiply(Multiply(A, ReduceSum(B)), Multiply(ReduceSum(B), C))
+    if (Match(multiply, m::Multiply(
+                          m::Multiply(&mul_lhs, m::Op(), m::Op()),
+                          m::Multiply(&mul_rhs, m::Op(), m::Op())))) {
+      
+      VLOG(10) << "ASSOCIATIVE_REDUCE: Found nested multiplies";
+      
+      // Extract operands from left multiply: Multiply(A, ReduceSum(B))
+      HloInstruction* lhs_op0 = mul_lhs->mutable_operand(0);
+      HloInstruction* lhs_op1 = mul_lhs->mutable_operand(1);
+      
+      // Extract operands from right multiply: Multiply(ReduceSum(B), C)
+      HloInstruction* rhs_op0 = mul_rhs->mutable_operand(0);
+      HloInstruction* rhs_op1 = mul_rhs->mutable_operand(1);
+      
+      // Find which operands are Reduce operations
+      HloInstruction* reduce_op = nullptr;
+      HloInstruction* a_operand = nullptr;
+      HloInstruction* c_operand = nullptr;
+      bool found_pattern = false;
+      
+      // Case 1: Multiply(A, Reduce) * Multiply(Reduce, C)
+      if (lhs_op1->opcode() == HloOpcode::kReduce && 
+          rhs_op0->opcode() == HloOpcode::kReduce &&
+          lhs_op1 == rhs_op0) {
+        reduce_op = lhs_op1;
+        a_operand = lhs_op0;
+        c_operand = rhs_op1;
+        found_pattern = true;
+        VLOG(10) << "ASSOCIATIVE_REDUCE: Pattern 1 - Multiply(A, Reduce) * Multiply(Reduce, C)";
+      }
+      // Case 2: Multiply(Reduce, A) * Multiply(C, Reduce)
+      else if (lhs_op0->opcode() == HloOpcode::kReduce && 
+               rhs_op1->opcode() == HloOpcode::kReduce &&
+               lhs_op0 == rhs_op1) {
+        reduce_op = lhs_op0;
+        a_operand = lhs_op1;
+        c_operand = rhs_op0;
+        found_pattern = true;
+        VLOG(10) << "ASSOCIATIVE_REDUCE: Pattern 2 - Multiply(Reduce, A) * Multiply(C, Reduce)";
+      }
+      // Case 3: Multiply(A, Reduce) * Multiply(C, Reduce)
+      else if (lhs_op1->opcode() == HloOpcode::kReduce && 
+               rhs_op1->opcode() == HloOpcode::kReduce &&
+               lhs_op1 == rhs_op1) {
+        reduce_op = lhs_op1;
+        a_operand = lhs_op0;
+        c_operand = rhs_op0;
+        found_pattern = true;
+        VLOG(10) << "ASSOCIATIVE_REDUCE: Pattern 3 - Multiply(A, Reduce) * Multiply(C, Reduce)";
+      }
+      // Case 4: Multiply(Reduce, A) * Multiply(Reduce, C)
+      else if (lhs_op0->opcode() == HloOpcode::kReduce && 
+               rhs_op0->opcode() == HloOpcode::kReduce &&
+               lhs_op0 == rhs_op0) {
+        reduce_op = lhs_op0;
+        a_operand = lhs_op1;
+        c_operand = rhs_op1;
+        found_pattern = true;
+        VLOG(10) << "ASSOCIATIVE_REDUCE: Pattern 4 - Multiply(Reduce, A) * Multiply(Reduce, C)";
+      }
+      
+      if (!found_pattern) {
+        VLOG(10) << "ASSOCIATIVE_REDUCE: Pattern doesn't match - no same Reduce in both multiplies";
+        goto SKIP_ASSOCIATIVE_REDUCE;
+      }
+      
+      VLOG(10) << "ASSOCIATIVE_REDUCE: Found Reduce=" << reduce_op->name() 
+               << ", A=" << a_operand->name() 
+               << ", C=" << c_operand->name();
+      
+      // Verify the reduce operation is a summation (Add)
+      HloComputation* reduce_computation = reduce_op->to_apply();
+      if (!reduce_computation) {
+        VLOG(10) << "ASSOCIATIVE_REDUCE: Reduce has no computation";
+        goto SKIP_ASSOCIATIVE_REDUCE;
+      }
+      
+      HloInstruction* reduce_root = reduce_computation->root_instruction();
+      if (reduce_root->opcode() != HloOpcode::kAdd) {
+        VLOG(10) << "ASSOCIATIVE_REDUCE: Reduce computation is not Add, it's " 
+                 << HloOpcodeString(reduce_root->opcode());
+        goto SKIP_ASSOCIATIVE_REDUCE;
+      }
+      
+      VLOG(10) << "ASSOCIATIVE_REDUCE: Verified Reduce is summation (Add)";
+      
+      // Check if operations have single users (for safe transformation)
+      if (mul_lhs->user_count() != 1 || mul_rhs->user_count() != 1) {
+        VLOG(10) << "ASSOCIATIVE_REDUCE: Inner multiply operations have multiple users";
+        goto SKIP_ASSOCIATIVE_REDUCE;
+      }
+      
+      // Verify shapes are compatible
+      if (!ShapeUtil::Compatible(reduce_op->shape(), a_operand->shape())) {
+        VLOG(10) << "ASSOCIATIVE_REDUCE: Shape mismatch between Reduce and A";
+        goto SKIP_ASSOCIATIVE_REDUCE;
+      }
+      
+      if (!ShapeUtil::Compatible(reduce_op->shape(), c_operand->shape())) {
+        VLOG(10) << "ASSOCIATIVE_REDUCE: Shape mismatch between Reduce and C";
+        goto SKIP_ASSOCIATIVE_REDUCE;
+      }
+      
+      VLOG(10) << "ASSOCIATIVE_REDUCE: All preconditions met, applying transformation";
+      
+      // Build the rewritten expression: A * Square(ReduceSum(B)) * C
+      
+      // Create Square(ReduceSum) = ReduceSum * ReduceSum
+      HloInstruction* square_reduce = computation_->AddInstruction(
+          HloInstruction::CreateBinary(
+              reduce_op->shape(), HloOpcode::kMultiply, reduce_op, reduce_op));
+      
+      // Create Square(ReduceSum) * C
+      HloInstruction* square_mul_c = computation_->AddInstruction(
+          HloInstruction::CreateBinary(
+              reduce_op->shape(), HloOpcode::kMultiply, square_reduce, c_operand));
+      
+      // Create final: A * (Square(ReduceSum) * C)
+      HloInstruction* final_mul = computation_->AddInstruction(
+          HloInstruction::CreateBinary(
+              multiply->shape(), HloOpcode::kMultiply, a_operand, square_mul_c));
+      
+      VLOG(10) << "ASSOCIATIVE_REDUCE: Created optimized expression: " << final_mul->name();
+      
+      return ReplaceInstruction(multiply, final_mul);
+    }
+  }
+  
+SKIP_ASSOCIATIVE_REDUCE:
+  VLOG(10) << "ASSOCIATIVE_REDUCE: Pattern not matched or preconditions not met";
+  // ========== End of DNNFusion Associative ReduceSum Rule ==========
+
   {
     // Mul(Negate(A), Negate(B)) => Mul(A, B)
     HloInstruction *a, *b;

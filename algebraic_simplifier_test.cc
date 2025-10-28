@@ -9155,6 +9155,75 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply_Commutative) {
   EXPECT_EQ(conv_count, 1);
 }
 
+// Test basic pattern: (A * ReduceSum(B)) * (ReduceSum(B) * C) => A * Square(ReduceSum(B)) * C
+TEST_F(AlgebraicSimplifierTest, AssociativeReduceSumMultiply) {
+  auto m = CreateNewVerifiedModule();
+  
+  const Shape input_shape = ShapeUtil::MakeShape(F32, {4, 8, 16});
+  const Shape reduced_shape = ShapeUtil::MakeShape(F32, {4, 16});  // After reducing dimension 1
+  
+  HloComputation::Builder b(TestName());
+  
+  // Create parameters A, B, C
+  auto* A = b.AddInstruction(HloInstruction::CreateParameter(0, reduced_shape, "A"));
+  auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, input_shape, "B"));
+  auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, reduced_shape, "C"));
+  
+  // Create reduction computation (summation)
+  HloComputation::Builder reduce_builder("reduce_sum");
+  auto* param0 = reduce_builder.AddInstruction(
+      HloInstruction::CreateParameter(0, ShapeUtil::MakeShape(F32, {}), "x"));
+  auto* param1 = reduce_builder.AddInstruction(
+      HloInstruction::CreateParameter(1, ShapeUtil::MakeShape(F32, {}), "y"));
+  reduce_builder.AddInstruction(
+      HloInstruction::CreateBinary(ShapeUtil::MakeShape(F32, {}), 
+                                   HloOpcode::kAdd, param0, param1));
+  HloComputation* reduce_computation = m->AddEmbeddedComputation(reduce_builder.Build());
+  
+  // Build: ReduceSum(B) - reduce along dimension 1
+  auto* init = b.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(0.0f)));
+  auto* reduce_sum = b.AddInstruction(
+      HloInstruction::CreateReduce(reduced_shape, B, init, {1}, reduce_computation));
+  
+  // Build: A * ReduceSum(B)
+  auto* mul_a_reduce = b.AddInstruction(
+      HloInstruction::CreateBinary(reduced_shape, HloOpcode::kMultiply, A, reduce_sum));
+  
+  // Build: ReduceSum(B) * C
+  auto* mul_reduce_c = b.AddInstruction(
+      HloInstruction::CreateBinary(reduced_shape, HloOpcode::kMultiply, reduce_sum, C));
+  
+  // Build: (A * ReduceSum) * (ReduceSum * C)
+  auto* final_mul = b.AddInstruction(
+      HloInstruction::CreateBinary(reduced_shape, HloOpcode::kMultiply, 
+                                   mul_a_reduce, mul_reduce_c));
+  
+  auto* computation = m->AddEntryComputation(b.Build(final_mul));
+  
+  LOG(INFO) << "Before simplification:\n" << m->ToString();
+  
+  AlgebraicSimplifierOptions opts = default_options_;
+  AlgebraicSimplifier simplifier(opts);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
+  
+  LOG(INFO) << "After simplification (changed=" << changed << "):\n" << m->ToString();
+  ASSERT_TRUE(changed);
+  
+  // Expected result: A * Square(ReduceSum(B)) * C
+  // Count reductions - should be only 1 now
+  int reduce_count = 0;
+  for (HloInstruction* inst : computation->instructions()) {
+    if (inst->opcode() == HloOpcode::kReduce) ++reduce_count;
+  }
+  EXPECT_EQ(reduce_count, 1) << "Expected exactly 1 reduction after optimization";
+  
+  // Verify structure: root should be Multiply(A, Multiply(Square(Reduce), C))
+  HloInstruction* root = computation->root_instruction();
+  EXPECT_EQ(root->opcode(), HloOpcode::kMultiply);
+}
+
+
 TEST_F(AlgebraicSimplifierTest, ScalarMultiplyReduction) {
   const char* hlo_string = R"(
 HloModule ConstScalarMultiply
