@@ -8696,6 +8696,19 @@ ENTRY AddDynamicUpdateSliceToAddSlice {
                         m::Parameter(2), m::Constant(), m::Constant())));
 }
 
+bool IsConstantOne(HloInstruction* inst) {
+  if (inst->opcode() == HloOpcode::kBroadcast) {
+    inst = inst->mutable_operand(0);
+  }
+  if (inst->opcode() == HloOpcode::kConstant) {
+    const Literal& literal = inst->literal();
+    if (literal.shape().element_type() == F32) {
+      return literal.IsAll(1.0f);
+    }
+  }
+  return false;
+}
+
 // Test basic pattern: Recip(Conv) * Recip(Mul(Conv, C)) => Recip(Square(Conv)) * Recip(C)
 TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply) {
   auto m = CreateNewVerifiedModule();
@@ -8865,6 +8878,99 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply) {
   }
   EXPECT_EQ(conv_count, 1);
 }
+
+// Test with Power(x, -1) representation for reciprocal
+TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply_PowerForm) {
+  auto m = CreateNewVerifiedModule();
+  
+  const Shape input_shape = ShapeUtil::MakeShape(F32, {1, 3, 224, 224});
+  const Shape kernel_shape = ShapeUtil::MakeShape(F32, {64, 3, 3, 3});
+  const Shape output_shape = ShapeUtil::MakeShape(F32, {1, 64, 224, 224});
+  
+  HloComputation::Builder b(TestName());
+  
+  auto* A = b.AddInstruction(HloInstruction::CreateParameter(0, input_shape, "A"));
+  auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, kernel_shape, "B"));
+  auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, output_shape, "C"));
+  
+  Window window;
+  for (int i = 0; i < 2; ++i) {
+    auto* dim = window.add_dimensions();
+    dim->set_size(3);
+    dim->set_stride(1);
+    dim->set_padding_low(1);
+    dim->set_padding_high(1);
+    dim->set_window_dilation(1);
+    dim->set_base_dilation(1);
+  }
+  
+  ConvolutionDimensionNumbers dnums;
+  dnums.set_input_batch_dimension(0);
+  dnums.set_input_feature_dimension(1);
+  dnums.add_input_spatial_dimensions(2);
+  dnums.add_input_spatial_dimensions(3);
+  dnums.set_kernel_output_feature_dimension(0);
+  dnums.set_kernel_input_feature_dimension(1);
+  dnums.add_kernel_spatial_dimensions(2);
+  dnums.add_kernel_spatial_dimensions(3);
+  dnums.set_output_batch_dimension(0);
+  dnums.set_output_feature_dimension(1);
+  dnums.add_output_spatial_dimensions(2);
+  dnums.add_output_spatial_dimensions(3);
+  
+  auto* conv = b.AddInstruction(HloInstruction::CreateConvolve(
+      output_shape, A, B, 1, 1, window, dnums, DefaultPrecisionConfig(2)));
+  
+  // Build: Reciprocal(Conv) using Power(Conv, -1)
+  auto* minus_one_conv = b.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(-1.0f)));
+  auto* minus_one_broadcast_conv = b.AddInstruction(
+      HloInstruction::CreateBroadcast(output_shape, minus_one_conv, {}));
+  auto* recip_conv = b.AddInstruction(
+      HloInstruction::CreateBinary(output_shape, HloOpcode::kPower, 
+                                   conv, minus_one_broadcast_conv));
+  
+  // Build: Conv * C
+  auto* mul_conv_c = b.AddInstruction(
+      HloInstruction::CreateBinary(output_shape, HloOpcode::kMultiply, conv, C));
+  
+  // Build: Reciprocal(Conv * C) using Power
+  auto* minus_one_mul = b.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(-1.0f)));
+  auto* minus_one_broadcast_mul = b.AddInstruction(
+      HloInstruction::CreateBroadcast(output_shape, minus_one_mul, {}));
+  auto* recip_mul = b.AddInstruction(
+      HloInstruction::CreateBinary(output_shape, HloOpcode::kPower, 
+                                   mul_conv_c, minus_one_broadcast_mul));
+  
+  // Build: Recip(Conv) * Recip(Conv * C)
+  auto* final_mul = b.AddInstruction(
+      HloInstruction::CreateBinary(output_shape, HloOpcode::kMultiply, 
+                                   recip_conv, recip_mul));
+  
+  auto* computation = m->AddEntryComputation(b.Build(final_mul));
+  
+  LOG(INFO) << "Before simplification:\n" << m->ToString();
+  
+  AlgebraicSimplifierOptions opts = default_options_;
+  AlgebraicSimplifier simplifier(opts);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
+  
+  LOG(INFO) << "After simplification (changed=" << changed << "):\n" << m->ToString();
+  ASSERT_TRUE(changed);
+  
+  // Verify only 1 convolution remains
+  int conv_count = 0;
+  for (HloInstruction* inst : computation->instructions()) {
+    if (inst->opcode() == HloOpcode::kConvolution) ++conv_count;
+  }
+  EXPECT_EQ(conv_count, 1);
+  
+  // Root should be Multiply
+  HloInstruction* root = computation->root_instruction();
+  EXPECT_EQ(root->opcode(), HloOpcode::kMultiply);
+}
+
 
 TEST_F(AlgebraicSimplifierTest, ScalarMultiplyReduction) {
   const char* hlo_string = R"(
