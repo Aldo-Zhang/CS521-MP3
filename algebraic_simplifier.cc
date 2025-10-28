@@ -4367,23 +4367,23 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   
   // Find the output dimension that corresponds to the RHS non-contracting dimension
   // For standard matmul, if RHS concat is on dim 1, output changes on its last non-batch dim
-  int64_t output_slice_dim = -1;
-  for (int64_t d = 0; d < fused_output_dims.size(); ++d) {
-    bool is_batch_out = has_batch && (d == dnums.lhs_batch_dimensions(0));
-    bool is_lhs_noncontracting_out = (d == (lhs_contracting_dim == 0 ? 1 : 0)) && !is_batch_out;
-    if (!is_batch_out && !is_lhs_noncontracting_out) {
-      // This should be the dimension corresponding to RHS non-contracting - 1
-      output_slice_dim = d - 1;
-      break;
-    }
-  }
+  int64_t output_slice_dim = fused_output_dims.size() - 1;
+  // for (int64_t d = 0; d < fused_output_dims.size(); ++d) {
+  //   bool is_batch_out = has_batch && (d == dnums.lhs_batch_dimensions(0));
+  //   bool is_lhs_noncontracting_out = (d == (lhs_contracting_dim == 0 ? 1 : 0)) && !is_batch_out;
+  //   if (!is_batch_out && !is_lhs_noncontracting_out) {
+  //     // This should be the dimension corresponding to RHS non-contracting - 1
+  //     output_slice_dim = d - 1;
+  //     break;
+  //   }
+  // }
   
-  if (output_slice_dim < 0) {
-    VLOG(10) << "FUSION SKIP: could not determine output slice dimension";
-    goto FUSE_SKIP;
-  }
+  // if (output_slice_dim < 0) {
+  //   VLOG(10) << "FUSION SKIP: could not determine output slice dimension";
+  //   goto FUSE_SKIP;
+  // }
   
-  VLOG(10) << "FUSION: output_slice_dim=" << output_slice_dim;
+  // VLOG(10) << "FUSION: output_slice_dim=" << output_slice_dim;
   
   fused_output_dims[output_slice_dim] = N_first + N_second;
   Shape fused_shape = ShapeUtil::MakeShape(out_ty, fused_output_dims);
