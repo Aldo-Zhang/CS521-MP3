@@ -4396,25 +4396,27 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   (*attrs.mutable_map())["_xla_fused_sibling_matmuls"] = "true";
   fused_dot->set_frontend_attributes(attrs);
 
-  // Create slice helper that works with arbitrary rank
-  auto make_slice = [&](int64_t start_idx, int64_t limit_idx) {
-    std::vector<int64_t> slice_shape_dims = fused_output_dims;
-    slice_shape_dims[output_slice_dim] = limit_idx - start_idx;
-    Shape s = ShapeUtil::MakeShape(out_ty, slice_shape_dims);
-    
-    std::vector<int64_t> start_indices(fused_output_dims.size(), 0);
-    std::vector<int64_t> limit_indices(fused_output_dims.begin(), fused_output_dims.end());
-    std::vector<int64_t> strides(fused_output_dims.size(), 1);
-    
-    start_indices[output_slice_dim] = start_idx;
-    limit_indices[output_slice_dim] = limit_idx;
-    
-    return comp->AddInstruction(HloInstruction::CreateSlice(
-        s, fused_dot, start_indices, limit_indices, strides));
-  };
+  auto make_slice = [&](const Shape& target_shape, int64_t start_idx, int64_t limit_idx) {
+  std::vector<int64_t> start_indices(fused_output_dims.size(), 0);
+  std::vector<int64_t> limit_indices(fused_output_dims.begin(), fused_output_dims.end());
+  std::vector<int64_t> strides(fused_output_dims.size(), 1);
   
-  HloInstruction* slice_for_first = make_slice(0, N_first);
-  HloInstruction* slice_for_second = make_slice(N_first, N_first + N_second);
+  start_indices[output_concat_dim] = start_idx;
+  limit_indices[output_concat_dim] = limit_idx;
+  
+  // Use the provided target_shape directly!
+  return comp->AddInstruction(HloInstruction::CreateSlice(
+      target_shape, fused_dot, start_indices, limit_indices, strides));
+};
+
+// Call with original shapes
+HloInstruction* slice_for_first = make_slice(
+    dot_is_first ? dot->shape() : other->shape(),  // Original shape!
+    0, N_first);
+    
+HloInstruction* slice_for_second = make_slice(
+    dot_is_first ? other->shape() : dot->shape(),  // Original shape!
+    N_first, N_first + N_second);
 
   HloInstruction* slice_for_dot = dot_is_first ? slice_for_first : slice_for_second;
   HloInstruction* slice_for_other = dot_is_first ? slice_for_second : slice_for_first;
