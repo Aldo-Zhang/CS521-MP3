@@ -9284,6 +9284,77 @@ TEST_F(AlgebraicSimplifierTest, AssociativeReduceSumMultiply_Commutative) {
   EXPECT_EQ(reduce_count, 1);
 }
 
+// Test that pattern is NOT applied when reduce operations have different computations
+TEST_F(AlgebraicSimplifierTest, AssociativeReduceSumMultiply_DifferentReductions) {
+  auto m = CreateNewVerifiedModule();
+  
+  const Shape input_shape = ShapeUtil::MakeShape(F32, {4, 8, 16});
+  const Shape reduced_shape = ShapeUtil::MakeShape(F32, {4, 16});
+  
+  HloComputation::Builder b(TestName());
+  
+  auto* A = b.AddInstruction(HloInstruction::CreateParameter(0, reduced_shape, "A"));
+  auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, input_shape, "B"));
+  auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, reduced_shape, "C"));
+  
+  // Create two different reduction computations
+  HloComputation::Builder reduce_sum_builder("reduce_sum");
+  auto* sum_p0 = reduce_sum_builder.AddInstruction(
+      HloInstruction::CreateParameter(0, ShapeUtil::MakeShape(F32, {}), "x"));
+  auto* sum_p1 = reduce_sum_builder.AddInstruction(
+      HloInstruction::CreateParameter(1, ShapeUtil::MakeShape(F32, {}), "y"));
+  reduce_sum_builder.AddInstruction(
+      HloInstruction::CreateBinary(ShapeUtil::MakeShape(F32, {}), 
+                                   HloOpcode::kAdd, sum_p0, sum_p1));
+  HloComputation* reduce_sum_comp = m->AddEmbeddedComputation(reduce_sum_builder.Build());
+  
+  HloComputation::Builder reduce_max_builder("reduce_max");
+  auto* max_p0 = reduce_max_builder.AddInstruction(
+      HloInstruction::CreateParameter(0, ShapeUtil::MakeShape(F32, {}), "x"));
+  auto* max_p1 = reduce_max_builder.AddInstruction(
+      HloInstruction::CreateParameter(1, ShapeUtil::MakeShape(F32, {}), "y"));
+  reduce_max_builder.AddInstruction(
+      HloInstruction::CreateBinary(ShapeUtil::MakeShape(F32, {}), 
+                                   HloOpcode::kMaximum, max_p0, max_p1));
+  HloComputation* reduce_max_comp = m->AddEmbeddedComputation(reduce_max_builder.Build());
+  
+  auto* init = b.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(0.0f)));
+  
+  // Different reductions
+  auto* reduce_sum = b.AddInstruction(
+      HloInstruction::CreateReduce(reduced_shape, B, init, {1}, reduce_sum_comp));
+  auto* reduce_max = b.AddInstruction(
+      HloInstruction::CreateReduce(reduced_shape, B, init, {1}, reduce_max_comp));
+  
+  auto* mul_a_sum = b.AddInstruction(
+      HloInstruction::CreateBinary(reduced_shape, HloOpcode::kMultiply, A, reduce_sum));
+  auto* mul_max_c = b.AddInstruction(
+      HloInstruction::CreateBinary(reduced_shape, HloOpcode::kMultiply, reduce_max, C));
+  
+  auto* final_mul = b.AddInstruction(
+      HloInstruction::CreateBinary(reduced_shape, HloOpcode::kMultiply, 
+                                   mul_a_sum, mul_max_c));
+  
+  auto* computation = m->AddEntryComputation(b.Build(final_mul));
+  
+  LOG(INFO) << "Before simplification:\n" << m->ToString();
+  
+  AlgebraicSimplifierOptions opts = default_options_;
+  AlgebraicSimplifier simplifier(opts);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
+  
+  LOG(INFO) << "After simplification:\n" << m->ToString();
+  
+  // Should NOT optimize because reductions are different
+  int reduce_count = 0;
+  for (HloInstruction* inst : computation->instructions()) {
+    if (inst->opcode() == HloOpcode::kReduce) ++reduce_count;
+  }
+  EXPECT_EQ(reduce_count, 2) << "Should keep both reductions when they're different";
+}
+
+
 TEST_F(AlgebraicSimplifierTest, ScalarMultiplyReduction) {
   const char* hlo_string = R"(
 HloModule ConstScalarMultiply
