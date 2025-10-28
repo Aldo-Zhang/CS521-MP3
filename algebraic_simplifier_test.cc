@@ -10248,7 +10248,7 @@ TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_NotLayoutSensitive) {
   options.set_is_layout_sensitive(false);  // Explicitly disable
   AlgebraicSimplifier simplifier(options);
   
-  simplifier.Run(m.get());
+  ASSERT_TRUE(simplifier.Run(m.get()).value());
   
   VLOG(1) << "After simplification:\n" << m->ToString();
   
@@ -10277,7 +10277,7 @@ TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_DifferentElementTypes) {
   options.set_is_layout_sensitive(true);
   AlgebraicSimplifier simplifier(options);
   
-  simplifier.Run(m.get());
+  ASSERT_TRUE(simplifier.Run(m.get()).value());
   
   // Verify the transformation preserves element type
   HloInstruction* root = computation->root_instruction();
@@ -10306,7 +10306,7 @@ TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_ChainOfReshapes) {
   options.set_is_layout_sensitive(true);
   AlgebraicSimplifier simplifier(options);
   
-  simplifier.Run(m.get());
+  ASSERT_TRUE(simplifier.Run(m.get()).value());
   
   // Verify the module is still valid after transformation
   EXPECT_NE(m->entry_computation(), nullptr);
