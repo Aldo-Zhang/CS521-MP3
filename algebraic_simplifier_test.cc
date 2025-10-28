@@ -8795,13 +8795,33 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply) {
   HloInstruction* mul_op0 = root->mutable_operand(0);
   HloInstruction* mul_op1 = root->mutable_operand(1);
   
+  // Helper to check if an instruction is a broadcast of constant 1
+  auto is_constant_one_broadcast = [](HloInstruction* inst) -> bool {
+    if (inst->opcode() == HloOpcode::kBroadcast) {
+      HloInstruction* operand = inst->mutable_operand(0);
+      if (operand->opcode() == HloOpcode::kConstant) {
+        const Literal& literal = operand->literal();
+        if (literal.shape().element_type() == F32) {
+          return literal.IsAll(1.0f);
+        }
+      }
+    } else if (inst->opcode() == HloOpcode::kConstant) {
+      const Literal& literal = inst->literal();
+      if (literal.shape().element_type() == F32) {
+        return literal.IsAll(1.0f);
+      }
+    }
+    return false;
+  };
+  
   // Find which is Recip(Square(Conv)) and which is Recip(C)
   HloInstruction* recip_square = nullptr;
   HloInstruction* recip_c = nullptr;
   
   auto is_reciprocal_of_c = [&](HloInstruction* inst) {
     if (inst->opcode() == HloOpcode::kDivide) {
-      return IsAll(inst->operand(0), 1) && inst->operand(1) == C;
+      return is_constant_one_broadcast(inst->mutable_operand(0)) && 
+             inst->operand(1) == C;
     }
     return false;
   };
@@ -8821,12 +8841,12 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply) {
   
   // Verify recip_c is Divide(1, C)
   EXPECT_EQ(recip_c->opcode(), HloOpcode::kDivide);
-  EXPECT_TRUE(IsAll(recip_c->operand(0), 1));
+  EXPECT_TRUE(is_constant_one_broadcast(recip_c->mutable_operand(0)));
   EXPECT_EQ(recip_c->operand(1), C);
   
   // Verify recip_square is Divide(1, Square(Conv))
   EXPECT_EQ(recip_square->opcode(), HloOpcode::kDivide);
-  EXPECT_TRUE(IsAll(recip_square->operand(0), 1));
+  EXPECT_TRUE(is_constant_one_broadcast(recip_square->mutable_operand(0)));
   
   HloInstruction* square = recip_square->mutable_operand(1);
   EXPECT_EQ(square->opcode(), HloOpcode::kMultiply);
@@ -8845,7 +8865,6 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply) {
   }
   EXPECT_EQ(conv_count, 1);
 }
-
 
 TEST_F(AlgebraicSimplifierTest, ScalarMultiplyReduction) {
   const char* hlo_string = R"(
