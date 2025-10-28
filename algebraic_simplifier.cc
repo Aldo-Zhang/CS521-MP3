@@ -7039,10 +7039,10 @@ absl::Status AlgebraicSimplifierVisitor::HandleReshape(
       goto SKIP_RESHAPE_DECOMPOSITION;
     }
 
-    if (!reshape->ReshapeMerelyInsertsOrDeletes1SizedDimensions().has_value()) {
-      VLOG(10) << "Skip reshape decomposition: not a trivial insert/delete of 1-sized dims.";
-      goto SKIP_RESHAPE_DECOMPOSITION;
-    }
+    // if (!reshape->ReshapeMerelyInsertsOrDeletes1SizedDimensions().has_value()) {
+    //   VLOG(10) << "Skip reshape decomposition: not a trivial insert/delete of 1-sized dims.";
+    //   goto SKIP_RESHAPE_DECOMPOSITION;
+    // }
 
     // Skip if this reshape is already a bitcast - no need to decompose
     if (ShapeUtil::ReshapeIsBitcast(output_shape, input_shape)) {
