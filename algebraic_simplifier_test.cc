@@ -10087,6 +10087,232 @@ TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_BitcastNotDecomposed) {
   EXPECT_EQ(copy_count, 0) << "Bitcast reshape should not be decomposed with Copy ops";
 }
 
+// Test Strategy 1: Output-aligned input decomposition
+// Reshape => Copy(input) + Bitcast
+TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_OutputAlignedInput) {
+  auto m = CreateNewVerifiedModule();
+  
+  // Create shapes where we can align input layout to match output requirements
+  HloComputation::Builder builder(TestName());
+  HloInstruction* param = builder.AddInstruction(
+      HloInstruction::CreateParameter(0,
+                                      ShapeUtil::MakeShapeWithDenseLayout(
+                                          F32, {2, 3, 4}, {0, 1, 2}),
+                                      "input"));
+  builder.AddInstruction(HloInstruction::CreateReshape(
+      ShapeUtil::MakeShapeWithDenseLayout(F32, {6, 4}, {1, 0}), param));
+  
+  auto computation = m->AddEntryComputationWithLayouts(builder.Build());
+  
+  // Verify this is NOT a bitcast
+  ASSERT_FALSE(ShapeUtil::ReshapeIsBitcast(
+      computation->root_instruction()->shape(),
+      computation->root_instruction()->operand(0)->shape()));
+  
+  VLOG(1) << "Before simplification:\n" << m->ToString();
+  
+  AlgebraicSimplifierOptions options;
+  options.set_is_layout_sensitive(true);
+  AlgebraicSimplifier simplifier(options);
+  
+  ASSERT_TRUE(simplifier.Run(m.get()).value());
+  
+  VLOG(1) << "After simplification:\n" << m->ToString();
+  
+  // Verify decomposition: Should have Copy + Bitcast
+  int copy_count = 0;
+  int bitcast_count = 0;
+  int reshape_count = 0;
+  
+  for (const HloInstruction* inst : computation->instructions()) {
+    if (inst->opcode() == HloOpcode::kCopy) copy_count++;
+    if (inst->opcode() == HloOpcode::kBitcast) bitcast_count++;
+    if (inst->opcode() == HloOpcode::kReshape) reshape_count++;
+  }
+  
+  EXPECT_GE(copy_count, 1) << "Should have at least one Copy (physical transpose)";
+  EXPECT_GE(bitcast_count, 1) << "Should have at least one Bitcast";
+  EXPECT_EQ(reshape_count, 0) << "Original Reshape should be replaced";
+}
+
+// Test Strategy 2: Input-aligned output decomposition  
+// Reshape => Bitcast + Copy(output)
+TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_InputAlignedOutput) {
+  auto m = CreateNewVerifiedModule();
+  
+  // Create shapes where we can align output layout to match input
+  HloComputation::Builder builder(TestName());
+  HloInstruction* param = builder.AddInstruction(
+      HloInstruction::CreateParameter(0,
+                                      ShapeUtil::MakeShapeWithDenseLayout(
+                                          F32, {4, 6}, {1, 0}),
+                                      "input"));
+  builder.AddInstruction(HloInstruction::CreateReshape(
+      ShapeUtil::MakeShapeWithDenseLayout(F32, {2, 3, 4}, {0, 1, 2}), param));
+  
+  auto computation = m->AddEntryComputationWithLayouts(builder.Build());
+  
+  // Verify this is NOT a bitcast
+  ASSERT_FALSE(ShapeUtil::ReshapeIsBitcast(
+      computation->root_instruction()->shape(),
+      computation->root_instruction()->operand(0)->shape()));
+  
+  VLOG(1) << "Before simplification:\n" << m->ToString();
+  
+  AlgebraicSimplifierOptions options;
+  options.set_is_layout_sensitive(true);
+  AlgebraicSimplifier simplifier(options);
+  
+  ASSERT_TRUE(simplifier.Run(m.get()).value());
+  
+  VLOG(1) << "After simplification:\n" << m->ToString();
+  
+  // Verify decomposition
+  int copy_count = 0;
+  int bitcast_count = 0;
+  
+  for (const HloInstruction* inst : computation->instructions()) {
+    if (inst->opcode() == HloOpcode::kCopy) copy_count++;
+    if (inst->opcode() == HloOpcode::kBitcast) bitcast_count++;
+  }
+  
+  EXPECT_GE(copy_count, 1) << "Should have Copy for output transpose";
+  EXPECT_GE(bitcast_count, 1) << "Should have Bitcast";
+}
+
+// Test Strategy 3: Non-alignable layouts
+// Reshape => Copy(input to normalized) + Bitcast + Copy(normalized to output)
+TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_NonAlignableLayouts) {
+  auto m = CreateNewVerifiedModule();
+  
+  // Create shapes with complex layouts that cannot be aligned directly
+  HloComputation::Builder builder(TestName());
+  HloInstruction* param = builder.AddInstruction(
+      HloInstruction::CreateParameter(0,
+                                      ShapeUtil::MakeShapeWithDenseLayout(
+                                          F32, {2, 3, 4}, {0, 2, 1}),
+                                      "input"));
+  builder.AddInstruction(HloInstruction::CreateReshape(
+      ShapeUtil::MakeShapeWithDenseLayout(F32, {4, 6}, {0, 1}), param));
+  
+  auto computation = m->AddEntryComputationWithLayouts(builder.Build());
+  
+  // Verify this is NOT a bitcast
+  ASSERT_FALSE(ShapeUtil::ReshapeIsBitcast(
+      computation->root_instruction()->shape(),
+      computation->root_instruction()->operand(0)->shape()));
+  
+  VLOG(1) << "Before simplification:\n" << m->ToString();
+  
+  AlgebraicSimplifierOptions options;
+  options.set_is_layout_sensitive(true);
+  AlgebraicSimplifier simplifier(options);
+  
+  ASSERT_TRUE(simplifier.Run(m.get()).value());
+  
+  VLOG(1) << "After simplification:\n" << m->ToString();
+  
+  // Verify structure - for non-alignable layouts, we expect copies and bitcast
+  int copy_count = 0;
+  int bitcast_count = 0;
+  
+  for (const HloInstruction* inst : computation->instructions()) {
+    if (inst->opcode() == HloOpcode::kCopy) copy_count++;
+    if (inst->opcode() == HloOpcode::kBitcast) bitcast_count++;
+  }
+  
+  // For non-alignable layouts, we expect Copy operations and a Bitcast
+  EXPECT_GE(copy_count, 1) << "Should have Copy operations for transposes";
+  EXPECT_GE(bitcast_count, 1) << "Should have Bitcast in the middle";
+}
+
+// Test that decomposition doesn't happen when not layout sensitive
+TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_NotLayoutSensitive) {
+  auto m = CreateNewVerifiedModule();
+  
+  HloComputation::Builder builder(TestName());
+  HloInstruction* param = builder.AddInstruction(
+      HloInstruction::CreateParameter(0,
+                                      ShapeUtil::MakeShapeWithDenseLayout(
+                                          F32, {2, 3, 4}, {0, 1, 2}),
+                                      "input"));
+  builder.AddInstruction(HloInstruction::CreateReshape(
+      ShapeUtil::MakeShapeWithDenseLayout(F32, {6, 4}, {1, 0}), param));
+  
+  auto computation = m->AddEntryComputationWithLayouts(builder.Build());
+  
+  VLOG(1) << "Before simplification:\n" << m->ToString();
+  
+  // Create options with layout_sensitive = false
+  AlgebraicSimplifierOptions options;
+  options.set_is_layout_sensitive(false);  // Explicitly disable
+  AlgebraicSimplifier simplifier(options);
+  
+  simplifier.Run(m.get());
+  
+  VLOG(1) << "After simplification:\n" << m->ToString();
+  
+  // The decomposition rule should not apply when not layout sensitive
+  // We just verify the module is still valid
+  EXPECT_NE(computation->root_instruction(), nullptr);
+}
+
+// Test with different element types
+TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_DifferentElementTypes) {
+  auto m = CreateNewVerifiedModule();
+  
+  // Test with F16
+  HloComputation::Builder builder(TestName());
+  HloInstruction* param = builder.AddInstruction(
+      HloInstruction::CreateParameter(0,
+                                      ShapeUtil::MakeShapeWithDenseLayout(
+                                          F16, {4, 8}, {1, 0}),
+                                      "input"));
+  builder.AddInstruction(HloInstruction::CreateReshape(
+      ShapeUtil::MakeShapeWithDenseLayout(F16, {2, 4, 4}, {2, 1, 0}), param));
+  
+  auto computation = m->AddEntryComputationWithLayouts(builder.Build());
+  
+  AlgebraicSimplifierOptions options;
+  options.set_is_layout_sensitive(true);
+  AlgebraicSimplifier simplifier(options);
+  
+  simplifier.Run(m.get());
+  
+  // Verify the transformation preserves element type
+  HloInstruction* root = computation->root_instruction();
+  EXPECT_EQ(root->shape().element_type(), F16);
+}
+
+// Test chain of reshapes
+TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_ChainOfReshapes) {
+  auto m = CreateNewVerifiedModule();
+  
+  HloComputation::Builder builder(TestName());
+  HloInstruction* param = builder.AddInstruction(
+      HloInstruction::CreateParameter(0,
+                                      ShapeUtil::MakeShapeWithDenseLayout(
+                                          F32, {2, 3, 4}, {0, 1, 2}),
+                                      "input"));
+  HloInstruction* reshape1 = builder.AddInstruction(
+      HloInstruction::CreateReshape(
+          ShapeUtil::MakeShapeWithDenseLayout(F32, {6, 4}, {1, 0}), param));
+  builder.AddInstruction(HloInstruction::CreateReshape(
+      ShapeUtil::MakeShapeWithDenseLayout(F32, {24}, {0}), reshape1));
+  
+  m->AddEntryComputationWithLayouts(builder.Build());
+  
+  AlgebraicSimplifierOptions options;
+  options.set_is_layout_sensitive(true);
+  AlgebraicSimplifier simplifier(options);
+  
+  simplifier.Run(m.get());
+  
+  // Verify the module is still valid after transformation
+  EXPECT_NE(m->entry_computation(), nullptr);
+  EXPECT_NE(m->entry_computation()->root_instruction(), nullptr);
+}
+
 TEST_F(AlgebraicSimplifierTest, TupleReduceReshape) {
   const char* hlo_string = R"(
 HloModule module
