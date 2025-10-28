@@ -4378,7 +4378,7 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     }
   }
   
-  if (output_slice_dim == -1) {
+  if (output_slice_dim < 0) {
     VLOG(10) << "FUSION SKIP: could not determine output slice dimension";
     goto FUSE_SKIP;
   }
