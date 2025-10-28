@@ -9420,6 +9420,60 @@ TEST_F(AlgebraicSimplifierTest, AssociativeReduceSumMultiply_DifferentReductions
   EXPECT_EQ(reduce_count, 2) << "Should keep both reductions when they're different";
 }
 
+// Test with different reduction dimensions
+TEST_F(AlgebraicSimplifierTest, AssociativeReduceSumMultiply_DifferentDimensions) {
+  auto m = CreateNewVerifiedModule();
+  
+  const Shape input_shape = ShapeUtil::MakeShape(F32, {4, 8, 16, 32});
+  const Shape reduced_shape = ShapeUtil::MakeShape(F32, {4, 16});  // Reduce dims 1 and 3
+  
+  HloComputation::Builder b(TestName());
+  
+  auto* A = b.AddInstruction(HloInstruction::CreateParameter(0, reduced_shape, "A"));
+  auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, input_shape, "B"));
+  auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, reduced_shape, "C"));
+  
+  HloComputation::Builder reduce_builder("reduce_sum");
+  auto* param0 = reduce_builder.AddInstruction(
+      HloInstruction::CreateParameter(0, ShapeUtil::MakeShape(F32, {}), "x"));
+  auto* param1 = reduce_builder.AddInstruction(
+      HloInstruction::CreateParameter(1, ShapeUtil::MakeShape(F32, {}), "y"));
+  reduce_builder.AddInstruction(
+      HloInstruction::CreateBinary(ShapeUtil::MakeShape(F32, {}), 
+                                   HloOpcode::kAdd, param0, param1));
+  HloComputation* reduce_computation = m->AddEmbeddedComputation(reduce_builder.Build());
+  
+  auto* init = b.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(0.0f)));
+  auto* reduce_sum = b.AddInstruction(
+      HloInstruction::CreateReduce(reduced_shape, B, init, {1, 3}, reduce_computation));
+  
+  auto* mul_a_reduce = b.AddInstruction(
+      HloInstruction::CreateBinary(reduced_shape, HloOpcode::kMultiply, A, reduce_sum));
+  auto* mul_reduce_c = b.AddInstruction(
+      HloInstruction::CreateBinary(reduced_shape, HloOpcode::kMultiply, reduce_sum, C));
+  
+  auto* final_mul = b.AddInstruction(
+      HloInstruction::CreateBinary(reduced_shape, HloOpcode::kMultiply, 
+                                   mul_a_reduce, mul_reduce_c));
+  
+  auto* computation = m->AddEntryComputation(b.Build(final_mul));
+  
+  LOG(INFO) << "Before simplification:\n" << m->ToString();
+  
+  AlgebraicSimplifierOptions opts = default_options_;
+  AlgebraicSimplifier simplifier(opts);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
+  
+  LOG(INFO) << "After simplification (changed=" << changed << "):\n" << m->ToString();
+  ASSERT_TRUE(changed);
+  
+  int reduce_count = 0;
+  for (HloInstruction* inst : computation->instructions()) {
+    if (inst->opcode() == HloOpcode::kReduce) ++reduce_count;
+  }
+  EXPECT_EQ(reduce_count, 1);
+}
 
 TEST_F(AlgebraicSimplifierTest, ScalarMultiplyReduction) {
   const char* hlo_string = R"(
