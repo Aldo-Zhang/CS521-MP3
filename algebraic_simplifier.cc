@@ -7143,14 +7143,11 @@ SKIP_RESHAPE_DECOMPOSITION:
   VLOG(10) << "RESHAPE_DECOMP: Pattern not matched or not layout sensitive";
   // ========== End of Reshape Decomposition Rule ==========
 
-  if (HloInstruction* bitcast_operand =
-          BitcastingOperandOfReshapeOrCopyChain(reshape, options_)) {
-    if (ShapeUtil::ReshapeIsBitcast(reshape->shape(), bitcast_operand->shape())) {
-      VLOG(3) << "Replacing reshape with bitcast: " << reshape->ToString();
-      auto bitcast = HloInstruction::CreateBitcast(reshape->shape(), bitcast_operand);
-      return ReplaceWithNewInstruction(reshape, std::move(bitcast));
-    }
-  }
+  if (ShapeUtil::ReshapeIsBitcast(reshape->shape(), bitcast_operand->shape()) &&
+    LayoutUtil::Equal(reshape->shape().layout(), bitcast_operand->shape().layout())) {
+  auto bitcast = HloInstruction::CreateBitcast(reshape->shape(), bitcast_operand);
+  return ReplaceWithNewInstruction(reshape, std::move(bitcast));
+}
 
   return absl::OkStatus();
 }
