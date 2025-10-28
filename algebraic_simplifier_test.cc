@@ -7755,7 +7755,8 @@ TEST_F(AlgebraicSimplifierTest, BatchDotTransposeOperands) {
             PrecisionConfig::DEFAULT);
 }
 
-TEST_F(AlgebraicSimplifierTest, FuseTwoMatmuls_ConcatAndSplit) {
+// Test 1: Original test case - 2D matmul without batch
+TEST_F(AlgebraicSimplifierTest, FuseTwoMatmuls_ConcatAndSplit_2D) {
   auto m = CreateNewVerifiedModule();
 
   // A:[M,K], B:[K,N1], C:[K,N2]
@@ -7770,16 +7771,13 @@ TEST_F(AlgebraicSimplifierTest, FuseTwoMatmuls_ConcatAndSplit) {
   auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, b_s, "B"));
   auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, c_s, "C"));
 
-  // Standard 2D matmul dnums
+  // Standard 2D matmul dnums: contracting on (1,0)
   DotDimensionNumbers dnums;
   dnums.add_lhs_contracting_dimensions(1);
   dnums.add_rhs_contracting_dimensions(0);
 
-  // Use the explicit 5-arg CreateDot.
-  Shape o1_shape =
-      ShapeUtil::MakeShape(F32, {a_s.dimensions(0), b_s.dimensions(1)});
-  Shape o2_shape =
-      ShapeUtil::MakeShape(F32, {a_s.dimensions(0), c_s.dimensions(1)});
+  Shape o1_shape = ShapeUtil::MakeShape(F32, {a_s.dimensions(0), b_s.dimensions(1)});
+  Shape o2_shape = ShapeUtil::MakeShape(F32, {a_s.dimensions(0), c_s.dimensions(1)});
 
   auto* O1 = b.AddInstruction(
       HloInstruction::CreateDot(o1_shape, A, B, dnums, DefaultPrecisionConfig(2)));
@@ -7789,18 +7787,16 @@ TEST_F(AlgebraicSimplifierTest, FuseTwoMatmuls_ConcatAndSplit) {
   b.AddInstruction(HloInstruction::CreateTuple({O1, O2}));
   auto* computation = m->AddEntryComputationWithLayouts(b.Build());
 
-  LOG(INFO) << "Before simplification:\n" << m->ToString();
+  VLOG(1) << "Before simplification:\n" << m->ToString();
 
-
-  // IMPORTANT: run the pass via helper to keep visitor/computation_ in sync.
   AlgebraicSimplifierOptions opts = default_options_;
   AlgebraicSimplifier simplifier(opts);
   TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
 
-  LOG(INFO) << "After simplification (changed=" << changed << "):\n" << m->ToString();
+  VLOG(1) << "After simplification (changed=" << changed << "):\n" << m->ToString();
   ASSERT_TRUE(changed);
 
-  // Root stays a tuple of two slices.
+  // Root stays a tuple of two slices
   HloInstruction* new_root = computation->root_instruction();
   ASSERT_EQ(new_root->opcode(), HloOpcode::kTuple);
 
@@ -7809,41 +7805,113 @@ TEST_F(AlgebraicSimplifierTest, FuseTwoMatmuls_ConcatAndSplit) {
   ASSERT_EQ(s0->opcode(), HloOpcode::kSlice);
   ASSERT_EQ(s1->opcode(), HloOpcode::kSlice);
 
-  // Both slices should slice the same fused dot.
+  // Both slices should slice the same fused dot
   HloInstruction* fused = s0->mutable_operand(0);
   ASSERT_EQ(fused, s1->mutable_operand(0));
   ASSERT_EQ(fused->opcode(), HloOpcode::kDot);
 
-  // Fused dot output shape must be [M, N1+N2].
+  // Fused dot output shape must be [M, N1+N2]
   EXPECT_TRUE(ShapeUtil::Compatible(
-      fused->shape(), ShapeUtil::MakeShape(F32, {8, 10 + 7})));
+      fused->shape(), ShapeUtil::MakeShape(F32, {8, 17})));
 
-  // RHS of fused dot is Concatenate(B, C, axis=1). Order may be (B,C) or (C,B).
+  // RHS of fused dot is Concatenate(B, C, axis=1)
   HloInstruction* rhs = fused->mutable_operand(1);
   ASSERT_EQ(rhs->opcode(), HloOpcode::kConcatenate);
   EXPECT_EQ(rhs->concatenate_dimension(), 1);
   EXPECT_TRUE((rhs->operand(0) == B && rhs->operand(1) == C) ||
               (rhs->operand(0) == C && rhs->operand(1) == B));
 
-  // Slice shapes match original O1/O2.
+  // Slice shapes match original O1/O2
   EXPECT_TRUE(ShapeUtil::Compatible(s0->shape(), o1_s));
   EXPECT_TRUE(ShapeUtil::Compatible(s1->shape(), o2_s));
 
-  // Slice index ranges are exactly [0:M, 0:N1] and [0:M, N1:N1+N2].
-  // (APIs exist on HloInstruction to read slice starts/limits.)
+  // Verify slice indices - slicing on dimension 1 (the output dimension from RHS)
   ASSERT_THAT(s0->slice_starts(), ::testing::ElementsAre(0, 0));
   ASSERT_THAT(s0->slice_limits(), ::testing::ElementsAre(8, 10));
   ASSERT_THAT(s1->slice_starts(), ::testing::ElementsAre(0, 10));
   ASSERT_THAT(s1->slice_limits(), ::testing::ElementsAre(8, 17));
+}
 
-  // Note: We don't delete the 'dead' dot node because
-  // the design of vistor dose not support so
-  
-  // int dot_count = 0;
-  // for (HloInstruction* inst : computation->instructions()) {
-  //   if (inst->opcode() == HloOpcode::kDot) ++dot_count;
-  // }
-  // EXPECT_EQ(dot_count, 1);
+// Test 2: 3D batched matmul - batch dimension at position 0
+TEST_F(AlgebraicSimplifierTest, FuseTwoMatmuls_ConcatAndSplit_BatchedMatmul) {
+  auto m = CreateNewVerifiedModule();
+
+  // A:[B,M,K], B:[B,K,N1], C:[B,K,N2]
+  // Batch size B=4, M=8, K=16, N1=10, N2=7
+  const Shape a_s = ShapeUtil::MakeShape(F32, {4, 8, 16});
+  const Shape b_s = ShapeUtil::MakeShape(F32, {4, 16, 10});
+  const Shape c_s = ShapeUtil::MakeShape(F32, {4, 16, 7});
+  const Shape o1_s = ShapeUtil::MakeShape(F32, {4, 8, 10});
+  const Shape o2_s = ShapeUtil::MakeShape(F32, {4, 8, 7});
+
+  HloComputation::Builder builder(TestName());
+  auto* A = builder.AddInstruction(HloInstruction::CreateParameter(0, a_s, "A"));
+  auto* B = builder.AddInstruction(HloInstruction::CreateParameter(1, b_s, "B"));
+  auto* C = builder.AddInstruction(HloInstruction::CreateParameter(2, c_s, "C"));
+
+  // Batched matmul: batch on dim 0, contracting on (2,1) for (lhs,rhs)
+  DotDimensionNumbers dnums;
+  dnums.add_lhs_batch_dimensions(0);
+  dnums.add_rhs_batch_dimensions(0);
+  dnums.add_lhs_contracting_dimensions(2);
+  dnums.add_rhs_contracting_dimensions(1);
+
+  Shape o1_shape = ShapeUtil::MakeShape(F32, {4, 8, 10});
+  Shape o2_shape = ShapeUtil::MakeShape(F32, {4, 8, 7});
+
+  auto* O1 = builder.AddInstruction(
+      HloInstruction::CreateDot(o1_shape, A, B, dnums, DefaultPrecisionConfig(2)));
+  auto* O2 = builder.AddInstruction(
+      HloInstruction::CreateDot(o2_shape, A, C, dnums, DefaultPrecisionConfig(2)));
+
+  builder.AddInstruction(HloInstruction::CreateTuple({O1, O2}));
+  auto* computation = m->AddEntryComputationWithLayouts(builder.Build());
+
+  VLOG(1) << "Before simplification:\n" << m->ToString();
+
+  AlgebraicSimplifierOptions opts = default_options_;
+  AlgebraicSimplifier simplifier(opts);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
+
+  VLOG(1) << "After simplification (changed=" << changed << "):\n" << m->ToString();
+  ASSERT_TRUE(changed);
+
+  // Root is tuple of two slices
+  HloInstruction* new_root = computation->root_instruction();
+  ASSERT_EQ(new_root->opcode(), HloOpcode::kTuple);
+
+  HloInstruction* s0 = new_root->mutable_operand(0);
+  HloInstruction* s1 = new_root->mutable_operand(1);
+  ASSERT_EQ(s0->opcode(), HloOpcode::kSlice);
+  ASSERT_EQ(s1->opcode(), HloOpcode::kSlice);
+
+  // Both slices should reference the same fused dot
+  HloInstruction* fused = s0->mutable_operand(0);
+  ASSERT_EQ(fused, s1->mutable_operand(0));
+  ASSERT_EQ(fused->opcode(), HloOpcode::kDot);
+
+  // Fused dot output shape must be [B, M, N1+N2] = [4, 8, 17]
+  EXPECT_TRUE(ShapeUtil::Compatible(
+      fused->shape(), ShapeUtil::MakeShape(F32, {4, 8, 17})));
+
+  // RHS of fused dot is Concatenate(B, C) on dimension 2
+  // (the non-batch, non-contracting dimension)
+  HloInstruction* rhs = fused->mutable_operand(1);
+  ASSERT_EQ(rhs->opcode(), HloOpcode::kConcatenate);
+  EXPECT_EQ(rhs->concatenate_dimension(), 2);
+  EXPECT_TRUE((rhs->operand(0) == B && rhs->operand(1) == C) ||
+              (rhs->operand(0) == C && rhs->operand(1) == B));
+
+  // Slice shapes match original outputs
+  EXPECT_TRUE(ShapeUtil::Compatible(s0->shape(), o1_s));
+  EXPECT_TRUE(ShapeUtil::Compatible(s1->shape(), o2_s));
+
+  // Verify slice indices - slicing on dimension 2 (the output dimension from RHS)
+  // Batch (dim 0) and M (dim 1) remain unchanged, only N dimension is sliced
+  ASSERT_THAT(s0->slice_starts(), ::testing::ElementsAre(0, 0, 0));
+  ASSERT_THAT(s0->slice_limits(), ::testing::ElementsAre(4, 8, 10));
+  ASSERT_THAT(s1->slice_starts(), ::testing::ElementsAre(0, 0, 10));
+  ASSERT_THAT(s1->slice_limits(), ::testing::ElementsAre(4, 8, 17));
 }
 
 TEST_F(AlgebraicSimplifierTest, BatchDotTransposeBatchDims) {

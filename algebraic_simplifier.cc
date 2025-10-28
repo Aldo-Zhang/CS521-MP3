@@ -883,10 +883,9 @@ absl::Status AlgebraicSimplifierVisitor::HandleAdd(HloInstruction* add) {
   if (Match(add, m::Add(
               m::Divide(m::Op(&x), m::Op(&den0)),
               m::Divide(m::Op(&z), m::Op(&den1))))) {
-
     auto src = [](HloInstruction* den) -> HloInstruction* {
       return den->opcode() == HloOpcode::kBroadcast ? den->mutable_operand(0) : den;
-    };
+    }; // If a op is broadcasted, find it's source
     HloInstruction* ys0 = src(den0);
     HloInstruction* ys1 = src(den1);
 
@@ -4206,17 +4205,19 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     return ReplaceInstruction(dot, dot_of_gather_optimized);
   }
 
-  // ---- Fuse Dot(A,B) and Dot(A,C) into Dot(A, concat(B,C, dim=1)) + slices ----
+// ---- Fuse Dot(A,B) and Dot(A,C) into Dot(A, concat(B,C, dim=1)) + slices ----
 {
   VLOG(10) << "FUSION BLOCK: checking dot " << dot->name();
-  if (dot->opcode() != HloOpcode::kDot || dot->shape().rank() != 2) goto FUSE_SKIP;
+  if (dot->opcode() != HloOpcode::kDot) goto FUSE_SKIP;
 
   if (dot->frontend_attributes().map().contains("_xla_fused_sibling_matmuls")) {
     VLOG(10) << "FUSION SKIP: dot " << dot->name() << " already fused (has marker)";
     goto FUSE_SKIP;
   }
   
-  HloComputation* comp = computation_; // Use the computation graph from visitor
+  // Use the computation graph from visitor this is because
+  // HandleDot will CHECK(computation_ == dot->parent());
+  HloComputation* comp = computation_; 
   if (comp == nullptr) goto FUSE_SKIP;
 
   if (dot->parent() != comp) goto FUSE_SKIP;
@@ -4226,19 +4227,32 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   if (!A || !B) goto FUSE_SKIP;
   VLOG(10) << "FUSION: A=" << A->name() << " B=" << B->name();
   if (A->parent() != comp || B->parent() != comp) goto FUSE_SKIP;
-  if (A->shape().rank() != 2 || B->shape().rank() != 2) goto FUSE_SKIP;
   if (B->opcode() == HloOpcode::kConcatenate) goto FUSE_SKIP;
 
   const DotDimensionNumbers& dnums = dot->dot_dimension_numbers();
-  const bool is_std_gemm =
-      dnums.lhs_contracting_dimensions_size() == 1 &&
-      dnums.rhs_contracting_dimensions_size() == 1 &&
-      dnums.lhs_contracting_dimensions(0) == 1 &&
-      dnums.rhs_contracting_dimensions(0) == 0;
-  if (!is_std_gemm) {
-    VLOG(10) << "FUSION SKIP: not std gemm";
+  
+  // Check that we have at most one batch dimension
+  if (dnums.lhs_batch_dimensions_size() > 1) {
+    VLOG(10) << "FUSION SKIP: more than one batch dimension";
     goto FUSE_SKIP;
   }
+  
+  // Check standard matmul pattern (with optional batch)
+  const bool has_batch = dnums.lhs_batch_dimensions_size() == 1;
+  const bool is_valid_matmul =
+      dnums.lhs_contracting_dimensions_size() == 1 &&
+      dnums.rhs_contracting_dimensions_size() == 1 &&
+      (!has_batch || (dnums.lhs_batch_dimensions(0) == dnums.rhs_batch_dimensions(0)));
+  
+  if (!is_valid_matmul) {
+    VLOG(10) << "FUSION SKIP: not valid matmul pattern";
+    goto FUSE_SKIP;
+  }
+
+  // For standard 2D: lhs_contracting=1, rhs_contracting=0
+  // For 3D batch: lhs_contracting and rhs_contracting should align
+  const int64_t lhs_contracting_dim = dnums.lhs_contracting_dimensions(0);
+  const int64_t rhs_contracting_dim = dnums.rhs_contracting_dimensions(0);
 
   VLOG(10) << "FUSION: searching for sibling dot sharing A=" << A->name();
 
@@ -4257,10 +4271,8 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
       VLOG(10) << "FUSION: skip user " << u->name() << " (already fused)";
       continue;
     }
-    if (u->shape().rank() != 2) continue;
     if (u->dot_dimension_numbers().SerializeAsString() != dnums.SerializeAsString()) continue;
     if (u->precision_config().SerializeAsString() != dot->precision_config().SerializeAsString()) continue;
-    if (u->operand(1)->shape().rank() != 2) continue;
     
     other = u;
     other_rhs = u->mutable_operand(1);
@@ -4284,22 +4296,50 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
 
   HloInstruction* C = other_rhs;
   if (!C || C->parent() != comp) goto FUSE_SKIP;
-  if (C->shape().rank() != 2) goto FUSE_SKIP;
   if (C->opcode() == HloOpcode::kConcatenate) goto FUSE_SKIP;
 
   const Shape& a = A->shape();
   const Shape& b = B->shape();
   const Shape& c = C->shape();
 
-  if (a.dimensions(1) != b.dimensions(0) || a.dimensions(1) != c.dimensions(0)) goto FUSE_SKIP;
+  // Verify shapes are compatible
+  if (a.rank() != b.rank() || a.rank() != c.rank()) goto FUSE_SKIP;
   if (a.element_type() != b.element_type() || a.element_type() != c.element_type()) goto FUSE_SKIP;
   if (dot->shape().element_type() != other->shape().element_type()) goto FUSE_SKIP;
 
-  const int64_t M  = a.dimensions(0);
-  const int64_t K  = a.dimensions(1);
-  const int64_t N1 = b.dimensions(1);
-  const int64_t N2 = c.dimensions(1);
+  // Find the non-contracting, non-batch dimension for RHS (this is where we concat)
+  // For RHS, we need to find the dimension that is NOT contracting and NOT batch
+  int64_t rhs_concat_dim = -1;
+  for (int64_t d = 0; d < b.rank(); ++d) {
+    bool is_contracting = (d == rhs_contracting_dim);
+    bool is_batch = has_batch && (d == dnums.rhs_batch_dimensions(0));
+    if (!is_contracting && !is_batch) {
+      rhs_concat_dim = d;
+      break;
+    }
+  }
+  
+  if (rhs_concat_dim == -1) {
+    VLOG(10) << "FUSION SKIP: could not find RHS concat dimension";
+    goto FUSE_SKIP;
+  }
+  
+  VLOG(10) << "FUSION: rhs_concat_dim=" << rhs_concat_dim;
 
+  // Verify that B and C have the same size along the concat dimension
+  const int64_t N1 = b.dimensions(rhs_concat_dim);
+  const int64_t N2 = c.dimensions(rhs_concat_dim);
+  
+  // Verify all other dimensions match
+  for (int64_t d = 0; d < b.rank(); ++d) {
+    if (d == rhs_concat_dim) continue;
+    if (b.dimensions(d) != c.dimensions(d)) {
+      VLOG(10) << "FUSION SKIP: B and C dimension mismatch at dim " << d;
+      goto FUSE_SKIP;
+    }
+  }
+
+  // Determine ordering based on unique_id
   bool dot_is_first = dot->unique_id() < other->unique_id();
   
   HloInstruction* first_rhs = dot_is_first ? B : C;
@@ -4311,13 +4351,43 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
            << " first_rhs=" << first_rhs->name() 
            << " second_rhs=" << second_rhs->name();
 
-  Shape rhs_shape = ShapeUtil::MakeShape(b.element_type(), {K, N_first + N_second});
+  // Create concatenated RHS shape
+  std::vector<int64_t> rhs_concat_shape_dims(b.dimensions().begin(), b.dimensions().end());
+  rhs_concat_shape_dims[rhs_concat_dim] = N_first + N_second;
+  Shape rhs_shape = ShapeUtil::MakeShape(b.element_type(), rhs_concat_shape_dims);
+  
   HloInstruction* rhs_concat = comp->AddInstruction(
-      HloInstruction::CreateConcatenate(rhs_shape, {first_rhs, second_rhs}, /*dimension=*/1));
+      HloInstruction::CreateConcatenate(rhs_shape, {first_rhs, second_rhs}, rhs_concat_dim));
 
-  // Fused dot
+  // Create fused dot output shape
+  // The output dimension corresponding to rhs_concat_dim needs to be updated
   const PrimitiveType out_ty = dot->shape().element_type();
-  Shape fused_shape = ShapeUtil::MakeShape(out_ty, {M, N_first + N_second});
+  std::vector<int64_t> fused_output_dims(dot->shape().dimensions().begin(), 
+                                          dot->shape().dimensions().end());
+  
+  // Find the output dimension that corresponds to the RHS non-contracting dimension
+  // For standard matmul, if RHS concat is on dim 1, output changes on its last non-batch dim
+  int64_t output_slice_dim = -1;
+  for (int64_t d = 0; d < fused_output_dims.size(); ++d) {
+    bool is_batch_out = has_batch && (d == dnums.lhs_batch_dimensions(0));
+    bool is_lhs_noncontracting_out = (d == (lhs_contracting_dim == 0 ? 1 : 0)) && !is_batch_out;
+    if (!is_batch_out && !is_lhs_noncontracting_out) {
+      // This should be the dimension corresponding to RHS non-contracting
+      output_slice_dim = d;
+      break;
+    }
+  }
+  
+  if (output_slice_dim == -1) {
+    VLOG(10) << "FUSION SKIP: could not determine output slice dimension";
+    goto FUSE_SKIP;
+  }
+  
+  VLOG(10) << "FUSION: output_slice_dim=" << output_slice_dim;
+  
+  fused_output_dims[output_slice_dim] = N_first + N_second;
+  Shape fused_shape = ShapeUtil::MakeShape(out_ty, fused_output_dims);
+  
   HloInstruction* fused_dot = comp->AddInstruction(
       HloInstruction::CreateDot(fused_shape, A, rhs_concat, dnums, dot->precision_config()));
   fused_dot->set_metadata(dot->metadata());
@@ -4326,10 +4396,21 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
   (*attrs.mutable_map())["_xla_fused_sibling_matmuls"] = "true";
   fused_dot->set_frontend_attributes(attrs);
 
-  auto make_slice = [&](int64_t cs, int64_t cl) {
-    Shape s = ShapeUtil::MakeShape(out_ty, {M, cl - cs});
+  // Create slice helper that works with arbitrary rank
+  auto make_slice = [&](int64_t start_idx, int64_t limit_idx) {
+    std::vector<int64_t> slice_shape_dims = fused_output_dims;
+    slice_shape_dims[output_slice_dim] = limit_idx - start_idx;
+    Shape s = ShapeUtil::MakeShape(out_ty, slice_shape_dims);
+    
+    std::vector<int64_t> start_indices(fused_output_dims.size(), 0);
+    std::vector<int64_t> limit_indices(fused_output_dims.begin(), fused_output_dims.end());
+    std::vector<int64_t> strides(fused_output_dims.size(), 1);
+    
+    start_indices[output_slice_dim] = start_idx;
+    limit_indices[output_slice_dim] = limit_idx;
+    
     return comp->AddInstruction(HloInstruction::CreateSlice(
-        s, fused_dot, /*start_indices=*/{0, cs}, /*limit_indices=*/{M, cl}, /*strides=*/{1, 1}));
+        s, fused_dot, start_indices, limit_indices, strides));
   };
   
   HloInstruction* slice_for_first = make_slice(0, N_first);
@@ -4343,7 +4424,7 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
 
   VLOG(10) << "FUSION: other user_count after replacement=" << other->user_count();
   
-  // NOTE: Do not remove 'other' here. The visitor may still visit it later
+  // NOTE: We do not remove 'other' here. The visitor may still visit it later
   // (visitor traversal ordering issue), and removing it would cause undefined
   // behavior. It's now dead code and will be cleaned up by the HloDCE pass,
   // following XLA's design pattern of separating optimization from cleanup.
@@ -7154,6 +7235,9 @@ SKIP_RESHAPE_DECOMPOSITION:
   VLOG(10) << "RESHAPE_DECOMP: Pattern not matched or not layout sensitive";
   // ========== End of Reshape Decomposition Rule ==========
 
+  // Modifications are made to ReshapeIsBitcast to let it handle
+  // Trivial cases where bitcast is good enough, for more complictaed
+  // cases are handled in Reshape Decomposition
   if (reshape->ReshapeMerelyInsertsOrDeletes1SizedDimensions().has_value()) {
     HloInstruction* bitcast_operand =
         BitcastingOperandOfReshapeOrCopyChain(reshape, options_);
