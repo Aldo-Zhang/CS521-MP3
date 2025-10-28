@@ -10048,8 +10048,8 @@ TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_BitcastNotDecomposed) {
   
   // Create a reshape that is already a bitcast
   // Bitcast: Same number of elements, layout-compatible transformation
-  const Shape input_shape = ShapeUtil::MakeShapeWithLayout(F32, {2, 3, 4}, {2, 1, 0});
-  const Shape output_shape = ShapeUtil::MakeShapeWithLayout(F32, {6, 4}, {1, 0});
+  const Shape input_shape = ShapeUtil::MakeShapeWithDenseLayout(F32, {2, 3, 4}, {2, 1, 0});
+  const Shape output_shape = ShapeUtil::MakeShapeWithDenseLayout(F32, {6, 4}, {1, 0});
   
   HloComputation::Builder b(TestName());
   auto* param = b.AddInstruction(
