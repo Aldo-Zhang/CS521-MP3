@@ -10057,7 +10057,7 @@ TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_BitcastNotDecomposed) {
   auto* reshape = b.AddInstruction(
       HloInstruction::CreateReshape(output_shape, param));
   
-  auto* computation = m->AddEntryComputation(b.Build(reshape));
+  auto* computation = m->AddEntryComputation(b.Build());
   
   // Verify this is actually a bitcast
   ASSERT_TRUE(ShapeUtil::ReshapeIsBitcast(output_shape, input_shape));
@@ -10069,12 +10069,11 @@ TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_BitcastNotDecomposed) {
   AlgebraicSimplifier simplifier(opts);
   
   // Run the simplifier
-  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
+  ASSERT_TRUE(simplifier.Run(m.get()).value());
   
   LOG(INFO) << "After simplification:\n" << m->ToString();
   
-  // For a bitcast reshape, other rules might convert it to an actual Bitcast op,
-  // but the decomposition rule specifically should not add Copy operations
+  // For a bitcast reshape, the decomposition rule should skip it
   // We check that there are no Copy operations added
   int copy_count = 0;
   for (const HloInstruction* inst : computation->instructions()) {
