@@ -10048,30 +10048,32 @@ TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_BitcastNotDecomposed) {
   
   // Create a reshape that is already a bitcast
   // Bitcast: Same number of elements, layout-compatible transformation
-  const Shape input_shape = ShapeUtil::MakeShapeWithDenseLayout(F32, {2, 3, 4}, {2, 1, 0});
-  const Shape output_shape = ShapeUtil::MakeShapeWithDenseLayout(F32, {6, 4}, {1, 0});
+  HloComputation::Builder builder(TestName());
+  HloInstruction* param = builder.AddInstruction(
+      HloInstruction::CreateParameter(0,
+                                      ShapeUtil::MakeShapeWithDenseLayout(
+                                          F32, {2, 3, 4}, {2, 1, 0}),
+                                      "input"));
+  builder.AddInstruction(HloInstruction::CreateReshape(
+      ShapeUtil::MakeShapeWithDenseLayout(F32, {6, 4}, {1, 0}), param));
   
-  HloComputation::Builder b(TestName());
-  auto* param = b.AddInstruction(
-      HloInstruction::CreateParameter(0, input_shape, "input"));
-  auto* reshape = b.AddInstruction(
-      HloInstruction::CreateReshape(output_shape, param));
-  
-  auto* computation = m->AddEntryComputation(b.Build());
+  auto computation = m->AddEntryComputationWithLayouts(builder.Build());
   
   // Verify this is actually a bitcast
-  ASSERT_TRUE(ShapeUtil::ReshapeIsBitcast(output_shape, input_shape));
+  ASSERT_TRUE(ShapeUtil::ReshapeIsBitcast(
+      computation->root_instruction()->shape(),
+      computation->root_instruction()->operand(0)->shape()));
   
-  LOG(INFO) << "Before simplification:\n" << m->ToString();
+  VLOG(1) << "Before simplification:\n" << m->ToString();
   
-  AlgebraicSimplifierOptions opts;
-  opts.set_is_layout_sensitive(true);
-  AlgebraicSimplifier simplifier(opts);
+  AlgebraicSimplifierOptions options;
+  options.set_is_layout_sensitive(true);
+  AlgebraicSimplifier simplifier(options);
   
   // Run the simplifier
   ASSERT_TRUE(simplifier.Run(m.get()).value());
   
-  LOG(INFO) << "After simplification:\n" << m->ToString();
+  VLOG(1) << "After simplification:\n" << m->ToString();
   
   // For a bitcast reshape, the decomposition rule should skip it
   // We check that there are no Copy operations added
