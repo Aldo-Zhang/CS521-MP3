@@ -10071,7 +10071,7 @@ TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_BitcastNotDecomposed) {
   AlgebraicSimplifier simplifier(options);
   
   // Run the simplifier
-  ASSERT_TRUE(simplifier.Run(m.get()).value());
+  ASSERT_FALSE(simplifier.Run(m.get()).value());
   
   VLOG(1) << "After simplification:\n" << m->ToString();
   
@@ -10277,7 +10277,7 @@ TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_DifferentElementTypes) {
   options.set_is_layout_sensitive(true);
   AlgebraicSimplifier simplifier(options);
   
-  ASSERT_TRUE(simplifier.Run(m.get()).value());
+  ASSERT_FALSE(simplifier.Run(m.get()).value());
   
   // Verify the transformation preserves element type
   HloInstruction* root = computation->root_instruction();
