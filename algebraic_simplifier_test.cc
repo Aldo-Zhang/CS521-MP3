@@ -8971,6 +8971,104 @@ TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply_PowerForm) {
   EXPECT_EQ(root->opcode(), HloOpcode::kMultiply);
 }
 
+// Test that pattern is NOT applied when operations have multiple users
+TEST_F(AlgebraicSimplifierTest, AssociativeConvReciprocalMultiply_MultipleUsers) {
+  auto m = CreateNewVerifiedModule();
+  
+  const Shape input_shape = ShapeUtil::MakeShape(F32, {1, 3, 224, 224});
+  const Shape kernel_shape = ShapeUtil::MakeShape(F32, {64, 3, 3, 3});
+  const Shape output_shape = ShapeUtil::MakeShape(F32, {1, 64, 224, 224});
+  
+  HloComputation::Builder b(TestName());
+  
+  auto* A = b.AddInstruction(HloInstruction::CreateParameter(0, input_shape, "A"));
+  auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, kernel_shape, "B"));
+  auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, output_shape, "C"));
+  
+  Window window;
+  for (int i = 0; i < 2; ++i) {
+    auto* dim = window.add_dimensions();
+    dim->set_size(3);
+    dim->set_stride(1);
+    dim->set_padding_low(1);
+    dim->set_padding_high(1);
+    dim->set_window_dilation(1);
+    dim->set_base_dilation(1);
+  }
+  
+  ConvolutionDimensionNumbers dnums;
+  dnums.set_input_batch_dimension(0);
+  dnums.set_input_feature_dimension(1);
+  dnums.add_input_spatial_dimensions(2);
+  dnums.add_input_spatial_dimensions(3);
+  dnums.set_kernel_output_feature_dimension(0);
+  dnums.set_kernel_input_feature_dimension(1);
+  dnums.add_kernel_spatial_dimensions(2);
+  dnums.add_kernel_spatial_dimensions(3);
+  dnums.set_output_batch_dimension(0);
+  dnums.set_output_feature_dimension(1);
+  dnums.add_output_spatial_dimensions(2);
+  dnums.add_output_spatial_dimensions(3);
+  
+  auto* conv = b.AddInstruction(HloInstruction::CreateConvolve(
+      output_shape, A, B, 1, 1, window, dnums, DefaultPrecisionConfig(2)));
+  
+  auto* one = b.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0f)));
+  auto* one_broadcast = b.AddInstruction(
+      HloInstruction::CreateBroadcast(output_shape, one, {}));
+  
+  auto* recip_conv = b.AddInstruction(
+      HloInstruction::CreateBinary(output_shape, HloOpcode::kDivide, 
+                                   one_broadcast, conv));
+  
+  auto* mul_conv_c = b.AddInstruction(
+      HloInstruction::CreateBinary(output_shape, HloOpcode::kMultiply, conv, C));
+  
+  auto* one2 = b.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0f)));
+  auto* one_broadcast2 = b.AddInstruction(
+      HloInstruction::CreateBroadcast(output_shape, one2, {}));
+  auto* recip_mul = b.AddInstruction(
+      HloInstruction::CreateBinary(output_shape, HloOpcode::kDivide, 
+                                   one_broadcast2, mul_conv_c));
+  
+  auto* final_mul = b.AddInstruction(
+      HloInstruction::CreateBinary(output_shape, HloOpcode::kMultiply, 
+                                   recip_conv, recip_mul));
+  
+  // Add extra user to recip_conv to prevent optimization
+  auto* extra_user = b.AddInstruction(
+      HloInstruction::CreateBinary(output_shape, HloOpcode::kAdd, recip_conv, C));
+  
+  // Create tuple to use both outputs
+  b.AddInstruction(HloInstruction::CreateTuple({final_mul, extra_user}));
+  
+  auto* computation = m->AddEntryComputation(b.Build());
+  
+  LOG(INFO) << "Before simplification:\n" << m->ToString();
+  
+  AlgebraicSimplifierOptions opts = default_options_;
+  AlgebraicSimplifier simplifier(opts);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
+  
+  LOG(INFO) << "After simplification (changed=" << changed << "):\n" << m->ToString();
+  
+  // The optimization should NOT be applied because recip_conv has multiple users
+  // Original pattern should still exist - we can't easily verify this stays unchanged,
+  // but we can verify that the convolution is still used multiple times indirectly
+  bool found_recip_with_multiple_users = false;
+  for (HloInstruction* inst : computation->instructions()) {
+    if (inst->opcode() == HloOpcode::kDivide && 
+        IsConstantOne(inst->mutable_operand(0)) &&
+        inst->user_count() > 1) {
+      found_recip_with_multiple_users = true;
+      break;
+    }
+  }
+  
+  EXPECT_TRUE(found_recip_with_multiple_users);
+}
 
 TEST_F(AlgebraicSimplifierTest, ScalarMultiplyReduction) {
   const char* hlo_string = R"(
