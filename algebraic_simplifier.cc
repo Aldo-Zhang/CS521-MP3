@@ -4372,8 +4372,8 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     bool is_batch_out = has_batch && (d == dnums.lhs_batch_dimensions(0));
     bool is_lhs_noncontracting_out = (d == (lhs_contracting_dim == 0 ? 1 : 0)) && !is_batch_out;
     if (!is_batch_out && !is_lhs_noncontracting_out) {
-      // This should be the dimension corresponding to RHS non-contracting
-      output_slice_dim = d;
+      // This should be the dimension corresponding to RHS non-contracting - 1
+      output_slice_dim = d - 1;
       break;
     }
   }
