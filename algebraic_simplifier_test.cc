@@ -10042,6 +10042,50 @@ ENTRY %entry {
   EXPECT_EQ(root->padding_config().dimensions(2).edge_padding_high(), 0);
 }
 
+// Test that bitcast reshapes are not decomposed (already optimal)
+TEST_F(AlgebraicSimplifierTest, ReshapeDecomposition_BitcastNotDecomposed) {
+  auto m = CreateNewVerifiedModule();
+  
+  // Create a reshape that is already a bitcast
+  // Bitcast: Same number of elements, layout-compatible transformation
+  const Shape input_shape = ShapeUtil::MakeShapeWithLayout(F32, {2, 3, 4}, {2, 1, 0});
+  const Shape output_shape = ShapeUtil::MakeShapeWithLayout(F32, {6, 4}, {1, 0});
+  
+  HloComputation::Builder b(TestName());
+  auto* param = b.AddInstruction(
+      HloInstruction::CreateParameter(0, input_shape, "input"));
+  auto* reshape = b.AddInstruction(
+      HloInstruction::CreateReshape(output_shape, param));
+  
+  auto* computation = m->AddEntryComputation(b.Build(reshape));
+  
+  // Verify this is actually a bitcast
+  ASSERT_TRUE(ShapeUtil::ReshapeIsBitcast(output_shape, input_shape));
+  
+  LOG(INFO) << "Before simplification:\n" << m->ToString();
+  
+  AlgebraicSimplifierOptions opts;
+  opts.set_is_layout_sensitive(true);
+  AlgebraicSimplifier simplifier(opts);
+  
+  // Run the simplifier
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
+  
+  LOG(INFO) << "After simplification:\n" << m->ToString();
+  
+  // For a bitcast reshape, other rules might convert it to an actual Bitcast op,
+  // but the decomposition rule specifically should not add Copy operations
+  // We check that there are no Copy operations added
+  int copy_count = 0;
+  for (const HloInstruction* inst : computation->instructions()) {
+    if (inst->opcode() == HloOpcode::kCopy) {
+      copy_count++;
+    }
+  }
+  
+  EXPECT_EQ(copy_count, 0) << "Bitcast reshape should not be decomposed with Copy ops";
+}
+
 TEST_F(AlgebraicSimplifierTest, TupleReduceReshape) {
   const char* hlo_string = R"(
 HloModule module

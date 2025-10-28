@@ -6769,7 +6769,7 @@ absl::Status AlgebraicSimplifierVisitor::HandleRemainder(
 absl::Status AlgebraicSimplifierVisitor::HandleReshape(
     HloInstruction* reshape) {
   auto operand = reshape->mutable_operand(0);
-
+  
   // Reshape directly to empty constant if the shape contains zero-element
   // dimension.
   if (ShapeUtil::IsZeroElementArray(reshape->shape())) {
@@ -7026,6 +7026,129 @@ absl::Status AlgebraicSimplifierVisitor::HandleReshape(
           BitcastingOperandOfReshapeOrCopyChain(reshape, options_)) {
     ReplaceWithBitcast(reshape, bitcast_operand);
   }
+
+  // ========== Reshape Decomposition Rule (from reshape_decomposer.cc) ==========
+  // Pattern: Decompose Reshape into Bitcast + Copy operations for better hardware utilization
+  // This rule converts non-bitcast reshapes into a combination of bitcast and physical transpose
+  // operations, which can be more efficient on hardware that has specialized transpose units.
+  
+  VLOG(10) << "trying reshape decomposition: " << reshape->ToString();
+  
+  if (options_.is_layout_sensitive()) {
+    HloInstruction* operand = reshape->mutable_operand(0);
+    auto output_shape = reshape->shape();
+    auto input_shape = operand->shape();
+    
+    // Skip if this reshape is already a bitcast - no need to decompose
+    if (ShapeUtil::ReshapeIsBitcast(output_shape, input_shape)) {
+      VLOG(10) << "RESHAPE_DECOMP: Already a bitcast, skipping";
+      goto SKIP_RESHAPE_DECOMPOSITION;
+    }
+    
+    // Strategy 1: Try to align input layout to output layout
+    // This allows: Reshape => Copy(input to aligned) + Bitcast(aligned to output)
+    if (auto output_aligned_input_shape = 
+            ShapeUtil::AlignLayouts(output_shape, input_shape)) {
+      Shape aligned_input_shape = *output_aligned_input_shape;
+      
+      VLOG(10) << "RESHAPE_DECOMP: Strategy 1 - Aligning input to output layout";
+      VLOG(10) << "  Input shape: " << ShapeUtil::HumanString(input_shape);
+      VLOG(10) << "  Aligned shape: " << ShapeUtil::HumanString(aligned_input_shape);
+      VLOG(10) << "  Output shape: " << ShapeUtil::HumanString(output_shape);
+      
+      // Create Copy to transform input to aligned layout (physical transpose)
+      HloInstruction* copied_operand = MakeCopyHlo(operand, aligned_input_shape);
+      
+      // Create Bitcast from aligned layout to output shape
+      HloInstruction* bitcast = MakeBitcastHlo(copied_operand, output_shape, 
+                                               &copied_operand->metadata());
+      
+      // Verify the bitcast is valid
+      if (!ShapeUtil::ReshapeIsBitcast(bitcast->shape(), 
+                                       bitcast->operand(0)->shape())) {
+        VLOG(10) << "RESHAPE_DECOMP: Strategy 1 failed - result is not a bitcast";
+        goto SKIP_RESHAPE_DECOMPOSITION;
+      }
+      
+      VLOG(3) << "Decomposing reshape into copy (physical transpose on operand) "
+              << "and bitcast: " << bitcast->ToString();
+      
+      return ReplaceInstruction(reshape, bitcast);
+    }
+    
+    // Strategy 2: Try to align output layout to input layout
+    // This allows: Reshape => Bitcast(input to aligned) + Copy(aligned to output)
+    if (auto input_aligned_output_shape = 
+            ShapeUtil::AlignLayouts(input_shape, output_shape)) {
+      Shape aligned_output_shape = *input_aligned_output_shape;
+      
+      VLOG(10) << "RESHAPE_DECOMP: Strategy 2 - Aligning output to input layout";
+      VLOG(10) << "  Input shape: " << ShapeUtil::HumanString(input_shape);
+      VLOG(10) << "  Aligned shape: " << ShapeUtil::HumanString(aligned_output_shape);
+      VLOG(10) << "  Output shape: " << ShapeUtil::HumanString(output_shape);
+      
+      // Create Bitcast from input to aligned output layout
+      HloInstruction* bitcast = MakeBitcastHlo(operand, aligned_output_shape, 
+                                               &operand->metadata());
+      
+      // Verify the bitcast is valid
+      if (!ShapeUtil::ReshapeIsBitcast(bitcast->shape(), 
+                                       bitcast->operand(0)->shape())) {
+        VLOG(10) << "RESHAPE_DECOMP: Strategy 2 failed - result is not a bitcast";
+        goto SKIP_RESHAPE_DECOMPOSITION;
+      }
+      
+      // Create Copy to transform to final output layout (physical transpose)
+      HloInstruction* copied_result = MakeCopyHlo(bitcast, output_shape);
+      
+      VLOG(3) << "Decomposing reshape into bitcast and copy (physical transpose "
+              << "on result): " << copied_result->ToString();
+      
+      return ReplaceInstruction(reshape, copied_result);
+    }
+    
+    // Strategy 3: Neither input nor output are alignable
+    // Use normalized (descending) layout as intermediate
+    // This creates: Copy(input to normalized) + Bitcast(normalized to normalized) 
+    //               + Copy(normalized to output)
+    VLOG(10) << "RESHAPE_DECOMP: Strategy 3 - Both input and output not alignable, "
+             << "using normalized layout as intermediate";
+    
+    // Create normalized version of input shape (descending layout)
+    Shape normalized_input_shape = ShapeUtil::MakeShapeWithDescendingLayout(
+        input_shape.element_type(), input_shape.dimensions());
+    
+    // Copy input to normalized layout (first physical transpose)
+    HloInstruction* normalized_input = MakeCopyHlo(operand, normalized_input_shape);
+    
+    // Create normalized version of output shape (descending layout)
+    Shape normalized_output_shape = ShapeUtil::MakeShapeWithDescendingLayout(
+        output_shape.element_type(), output_shape.dimensions());
+    
+    // Bitcast from normalized input to normalized output
+    HloInstruction* bitcast = MakeBitcastHlo(normalized_input, normalized_output_shape,
+                                             &normalized_input->metadata());
+    
+    // Verify the bitcast is valid
+    if (!ShapeUtil::ReshapeIsBitcast(bitcast->shape(), 
+                                     bitcast->operand(0)->shape())) {
+      VLOG(10) << "RESHAPE_DECOMP: Strategy 3 failed - result is not a bitcast";
+      goto SKIP_RESHAPE_DECOMPOSITION;
+    }
+    
+    // Copy from normalized output to final output layout (second physical transpose)
+    HloInstruction* final_output = MakeCopyHlo(bitcast, output_shape);
+    
+    VLOG(3) << "Decomposing reshape into two copies (physical transposes) "
+            << "and bitcast: " << final_output->ToString();
+    
+    return ReplaceInstruction(reshape, final_output);
+  }
+  
+SKIP_RESHAPE_DECOMPOSITION:
+  VLOG(10) << "RESHAPE_DECOMP: Pattern not matched or not layout sensitive";
+  // ========== End of Reshape Decomposition Rule ==========
+
   return absl::OkStatus();
 }
 
