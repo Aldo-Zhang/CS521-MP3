@@ -9223,6 +9223,66 @@ TEST_F(AlgebraicSimplifierTest, AssociativeReduceSumMultiply) {
   EXPECT_EQ(root->opcode(), HloOpcode::kMultiply);
 }
 
+// Test commutative variant: (ReduceSum * A) * (C * ReduceSum)
+TEST_F(AlgebraicSimplifierTest, AssociativeReduceSumMultiply_Commutative) {
+  auto m = CreateNewVerifiedModule();
+  
+  const Shape input_shape = ShapeUtil::MakeShape(F32, {4, 8, 16});
+  const Shape reduced_shape = ShapeUtil::MakeShape(F32, {4, 16});
+  
+  HloComputation::Builder b(TestName());
+  
+  auto* A = b.AddInstruction(HloInstruction::CreateParameter(0, reduced_shape, "A"));
+  auto* B = b.AddInstruction(HloInstruction::CreateParameter(1, input_shape, "B"));
+  auto* C = b.AddInstruction(HloInstruction::CreateParameter(2, reduced_shape, "C"));
+  
+  // Create reduction computation
+  HloComputation::Builder reduce_builder("reduce_sum");
+  auto* param0 = reduce_builder.AddInstruction(
+      HloInstruction::CreateParameter(0, ShapeUtil::MakeShape(F32, {}), "x"));
+  auto* param1 = reduce_builder.AddInstruction(
+      HloInstruction::CreateParameter(1, ShapeUtil::MakeShape(F32, {}), "y"));
+  reduce_builder.AddInstruction(
+      HloInstruction::CreateBinary(ShapeUtil::MakeShape(F32, {}), 
+                                   HloOpcode::kAdd, param0, param1));
+  HloComputation* reduce_computation = m->AddEmbeddedComputation(reduce_builder.Build());
+  
+  auto* init = b.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(0.0f)));
+  auto* reduce_sum = b.AddInstruction(
+      HloInstruction::CreateReduce(reduced_shape, B, init, {1}, reduce_computation));
+  
+  // Build: ReduceSum(B) * A (reversed order)
+  auto* mul_reduce_a = b.AddInstruction(
+      HloInstruction::CreateBinary(reduced_shape, HloOpcode::kMultiply, reduce_sum, A));
+  
+  // Build: C * ReduceSum(B) (reversed order)
+  auto* mul_c_reduce = b.AddInstruction(
+      HloInstruction::CreateBinary(reduced_shape, HloOpcode::kMultiply, C, reduce_sum));
+  
+  // Build: (ReduceSum * A) * (C * ReduceSum)
+  auto* final_mul = b.AddInstruction(
+      HloInstruction::CreateBinary(reduced_shape, HloOpcode::kMultiply, 
+                                   mul_reduce_a, mul_c_reduce));
+  
+  auto* computation = m->AddEntryComputation(b.Build(final_mul));
+  
+  LOG(INFO) << "Before simplification:\n" << m->ToString();
+  
+  AlgebraicSimplifierOptions opts = default_options_;
+  AlgebraicSimplifier simplifier(opts);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&simplifier, m.get()));
+  
+  LOG(INFO) << "After simplification (changed=" << changed << "):\n" << m->ToString();
+  ASSERT_TRUE(changed);
+  
+  // Should still optimize despite reversed order
+  int reduce_count = 0;
+  for (HloInstruction* inst : computation->instructions()) {
+    if (inst->opcode() == HloOpcode::kReduce) ++reduce_count;
+  }
+  EXPECT_EQ(reduce_count, 1);
+}
 
 TEST_F(AlgebraicSimplifierTest, ScalarMultiplyReduction) {
   const char* hlo_string = R"(
