@@ -7144,10 +7144,11 @@ SKIP_RESHAPE_DECOMPOSITION:
   // ========== End of Reshape Decomposition Rule ==========
 
   if (HloInstruction* bitcast_operand =
-        BitcastingOperandOfReshapeOrCopyChain(reshape, options_)) {
+          BitcastingOperandOfReshapeOrCopyChain(reshape, options_)) {
     if (ShapeUtil::ReshapeIsBitcast(reshape->shape(), bitcast_operand->shape())) {
       VLOG(3) << "Replacing reshape with bitcast: " << reshape->ToString();
-      return ReplaceWithBitcast(reshape, bitcast_operand);
+      auto bitcast = HloInstruction::CreateBitcast(reshape->shape(), bitcast_operand);
+      return ReplaceWithNewInstruction(reshape, std::move(bitcast));
     }
   }
 
